@@ -2,12 +2,13 @@ use std::fs;
 use either::{Either, Left, Right};
 use std::fs::{File, OpenOptions};
 use std::io::{stdin, stdout, BufRead, BufReader, BufWriter, Write};
-use std::process::Stdio;
 
 use std::iter::Peekable;
+use std::ops::Deref;
 use chrono::{Datelike, Local};
 use regex::Regex;
 use yaml_rust::{yaml, Yaml, YamlEmitter, YamlLoader};
+use yaml_rust::yaml::Array;
 
 type TeXContent = String;
 
@@ -27,11 +28,11 @@ static NO_MATCH: &str = "";
 pub struct MarkdownDoc {
     title: String,
     decls: Vec<String>,
-    segs: Vec<Segment>, // assume (1)...($LEN), bound by bold TODO [Segment] should be more performant as on stack (esp. for col of col)
-    cache: Option<u8> // TODO make this byte array
+    segs: Vec<Segment>, // assume (1)...($LEN), bound by bold TODO [Segment] should be more performant as on stack (esp. for arr of arr)
+    cache: Option<u8> // TODO make this (Sized) byte array
 }
 
-// macro_rules! tex_decl { <-- relic of using technique of actually replacing placeholders
+// macro_rules! tex_decl { <-- relic of using technique of actually replacing placeholders in content... no need!
 //
 // }
 
@@ -63,28 +64,24 @@ impl MarkdownDoc {
         let (file, title) = (File::open(path).expect("Could not read file"), path.split('.').next().expect("File format bad").to_string());
         let mut content = BufReader::new(file).lines().map(|l| l.unwrap()).peekable();
 
-        // Parse decls (strips all $ — may be problematic for decls that use $$, but ObsiTeX theoretically shouldn't permit it.
-        let decl_ids: Vec<String> = {
-            let yaml = fs::read_to_string(PATH_DECLS).expect("Could not read decls YAML");                                    // ]
-            let decls = YamlLoader::load_from_str(&yaml).expect("Bad decls YAML")[0].as_vec().expect("Bad decls YAML"); // ] TODO fill hole of panick sadness
-                                                                                                                                          // ]
-            decls.iter().map(|d| {
+        // Note on parsing decls... strips all $ — may be problematic for decl macros that use $$, but obsitex theoretically shouldn't permit it.
+
+
+        // Take first (and only) document in YAML db.
+        let doc = {
+            let yaml = fs::read_to_string(PATH_DECLS).expect("Could not read file");
+            YamlLoader::load_from_str(&yaml).expect("Could not parse YAML")
+        }.into_iter().next().unwrap();
+        let mut cold_decls = doc.into_vec().expect("Bad decls array"); // TODO fill hole of expectation sadness
+
+        let decl_ids: Vec<String> = cold_decls.iter().map(|d| {
                 d.as_hash().expect("Bad decls YAML")
                     .get(&Yaml::String("id".to_string()))
                     .map(|s| s.as_str().unwrap().to_string())
                     .unwrap()
-            }).collect()
-        };
-        let mut decl_db: BufWriter<File> = {
-            let file = OpenOptions::new()
-                .write(true)
-                .append(true)
-                .open(PATH_DECLS)
-                .unwrap();
+            }).collect();
 
-            BufWriter::new(file)
-        };
-        let mut decls = {
+        let mut hot_decls = {
             let mut decls: Vec<String> = Vec::new();
 
             while let Some(_) = content.next_if(|l| l.is_empty()) {}; // <-- skip initial blanks
@@ -95,19 +92,27 @@ impl MarkdownDoc {
             decls
         };
 
-        let db_cands = decls.iter()
-            .filter(|&d| decl_ids.contains(d))
-            .collect::<Vec<String>>();
+        let db_cands: Vec<&String> = hot_decls.iter()
+            .filter(|&d| !decl_ids.contains(d))
+            .collect();
         if !db_cands.is_empty() && query("New decls found, add to db? (y/n)") == "y" { // <-- note! contingent on short-circuit eval of boolean.
-            let mut dump = String::new();
-            let mut emitter = YamlEmitter::new(&mut dump);
+            // let mut dump = String::new(); <-- TODO save mem by reusing same variables, must fix mut rules
+            // let mut emitter = YamlEmitter::new(&mut dump);
+
+            let mut decl_db: BufWriter<File> = {
+                let file = OpenOptions::new()
+                    .write(true)
+                    .append(false)
+                    .open(PATH_DECLS)
+                    .unwrap();
+
+                BufWriter::new(file)
+            };
 
             for cand in db_cands {
                 match decl2yaml(&cand) {
                     Ok(yaml) => {
-                        dump.clear();
-                        emitter.dump(&yaml).unwrap();
-                        decl_db.write(dump.as_bytes()).expect("Could not dump to decl DB");
+                        cold_decls.push(yaml);
                     },
                     Err(msg) => {
                         eprintln!("decl '{}' not written... {}", &cand, msg);
@@ -115,7 +120,12 @@ impl MarkdownDoc {
                 }
             }
 
-            decls.clear(); // <-- clear decls as already written to database
+            let mut dump = String::new();
+            let mut emitter = YamlEmitter::new(&mut dump);
+            emitter.dump(&Yaml::Array(cold_decls)).unwrap();
+
+            decl_db.write_all(dump.as_bytes()).expect("Could not write to decl DB"); // <-- write hot decls to db
+            hot_decls.clear();                                                            // <-- clear hot decls as already written to database
         }
 
         println!("\n\n");
@@ -152,7 +162,7 @@ impl MarkdownDoc {
         let cache = None;
 
 
-        Self { title, decls, segs, cache }
+        Self { title, decls: hot_decls, segs, cache }
     }
     pub fn compile(&self) -> TeXContent {
         let yaml = fs::read_to_string(PATH_DECLS).expect("Could not read decls YAML");
@@ -265,19 +275,11 @@ fn decl2yaml(decl: &str) -> Result<Yaml, String> {
     let (caps_valid, caps_invalid) = (re_valid.captures(decl), re_invalid.captures(decl));
 
     match (caps_valid, caps_invalid) {
-        (Some(caps), _) if caps.len() == 4 => {
+        (Some(caps), _) if caps.len() == 5 => { // <-- note that this is (1) full capture, (1) [$ID] opt group, (3) needed values.
             let mut hash = yaml::Hash::new();
             hash.insert(Yaml::String("id".to_string()), Yaml::String(caps["id"].to_string()));
-            hash.insert(Yaml::String("macro".to_string()), Yaml::String(caps["mac"].to_string()));
-            hash.insert(Yaml::String("pc".to_string()), Yaml::Integer(caps["pc"].parse::<i64>().unwrap()));
-            Ok(Yaml::Hash(hash))
-        },
-
-        (Some(caps), _) if caps.len() == 2 && caps.name("pc").is_none() => {
-            let mut hash = yaml::Hash::new();
-            hash.insert(Yaml::String("id".to_string()), Yaml::String(caps["id"].to_string()));
-            hash.insert(Yaml::String("macro".to_string()), Yaml::String(caps["mac"].to_string()));
-            hash.insert(Yaml::String("pc".to_string()), Yaml::Integer(0));
+            hash.insert(Yaml::String("macro".to_string()), Yaml::String(caps["macro"].to_string()));
+            hash.insert(Yaml::String("pc".to_string()), Yaml::Integer(caps.name("pc").and_then(|c| Some(c.as_str().parse::<i64>().unwrap())).unwrap_or(0)));
             Ok(Yaml::Hash(hash))
         },
 
@@ -307,4 +309,29 @@ fn consume_segment<I: Iterator<Item = String>>(content: &mut Peekable<I>, delim:
     }
 
     Segment { content: Right(body) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decl() {
+        let (re1, re2) = (Regex::new(REGEX_DECL_VALID).unwrap(), Regex::new(REGEX_DECL_INVALID).unwrap());
+        let yaml1 = r"\newcommand{\comm}[1]{\;\text{#1}\;}";
+        let yaml2 = r"\newcommand{\zq}{\phantom{}^2}";
+
+        let caps = re1.captures(yaml2).unwrap();
+        let len = caps.len();
+
+        for i in 0..len {
+            let cap = &caps[i];
+            println!("{}", cap);
+        }
+
+       // let decl1 = decl2yaml(yaml1);
+        let decl2 = decl2yaml(yaml2);
+
+        println!("{}", decl2.is_ok())
+    }
 }
