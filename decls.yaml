@@ -1,0 +1,7 @@
+- id: test1
+  macro: mac1
+  pc: 0
+
+- id: test2
+  macro: mac2
+  pc: 3
