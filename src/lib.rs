@@ -16,6 +16,7 @@ static REGEX_SEG_D1: &str = r"\*\*.*\*\*";
 static REGEX_SEG_D2: &str = r"\*.*\*";
 static REGEX_DECL_VALID: &str = r"\\newcommand\{\\(?P<id>[a-z]+)}(\[(?P<pc>\d+)])?\{(?P<macro>.*)}";
 static REGEX_DECL_INVALID: &str = r"\\newcommand\{\\(?P<id>.+)}(\[(?P<pc>.+)])?\{(?P<macro>.*)}";
+static REGEX_DECL_ID: &str = r"\\newcommand\{\\(?P<id>[a-z]+)}(\[\d+])?\{.*}";
 
 static CLASS_DEFAULT: &str = "Math 3345";
 static META_DEFAULT: &str = "MWF 1:50-2:45, Katz";
@@ -71,7 +72,7 @@ impl MarkdownDoc {
         let doc = {
             let yaml = fs::read_to_string(PATH_DECLS).expect("Could not read file");
             YamlLoader::load_from_str(&yaml).expect("Could not parse YAML")
-        }.into_iter().next().unwrap();
+        }.into_iter().next().unwrap_or(Yaml::Array(vec![]));
         let mut cold_decls = doc.into_vec().expect("Bad decls array"); // TODO fill hole of expectation sadness
 
         let decl_ids: Vec<String> = cold_decls.iter().map(|d| {
@@ -92,10 +93,14 @@ impl MarkdownDoc {
             decls
         };
 
+        let re_id = Regex::new(REGEX_DECL_ID).unwrap(); // TODO temp may be better to refactor decl2yaml as decomp_decl and decl2yaml using decomp tuple
         let db_cands: Vec<&String> = hot_decls.iter()
-            .filter(|&d| !decl_ids.contains(d))
+            .filter(|&d| {
+                let caps = re_id.captures(d).unwrap();
+                !decl_ids.contains(&caps["id"].to_string())
+            })
             .collect();
-        if !db_cands.is_empty() && query("New decls found, add to db? (y/n)") == "y" { // <-- note! contingent on short-circuit eval of boolean.
+        if !db_cands.is_empty() && query(&format!("{} new decls found, add to db? (y/n)", db_cands.len())) == "y" { // <-- note! contingent on short-circuit eval of boolean.
             // let mut dump = String::new(); <-- TODO save mem by reusing same variables, must fix mut rules
             // let mut emitter = YamlEmitter::new(&mut dump);
 
@@ -113,9 +118,10 @@ impl MarkdownDoc {
                 match decl2yaml(&cand) {
                     Ok(yaml) => {
                         cold_decls.push(yaml);
+                        println!("[OK] decl '{}' written", &cand);
                     },
                     Err(msg) => {
-                        eprintln!("decl '{}' not written... {}", &cand, msg);
+                        eprintln!("[ERR] decl '{}' not written, {}", &cand, msg);
                     }
                 }
             }
