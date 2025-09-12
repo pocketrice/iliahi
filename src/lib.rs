@@ -1,22 +1,25 @@
-use std::fs;
 use either::{Either, Left, Right};
+use std::fs;
 use std::fs::{File, OpenOptions};
 use std::io::{stdin, stdout, BufRead, BufReader, BufWriter, Write};
 
-use std::iter::Peekable;
-use std::ops::Deref;
 use chrono::{Datelike, Local};
 use regex::Regex;
+use std::iter::Peekable;
+use std::ops::Deref;
+use std::process::{Command, Stdio};
 use yaml_rust::{yaml, Yaml, YamlEmitter, YamlLoader};
-use yaml_rust::yaml::Array;
 
 type TeXContent = String;
 
-static REGEX_SEG_D1: &str = r"\*\*.*\*\*";
-static REGEX_SEG_D2: &str = r"\*.*\*";
+static REGEX_META_NCAP: &str = r".*\(\?P<(?P<ncap>.+)>.*\).*"; // <-- note, this means only limited to one named capture group for regmerge!
+static REGEX_SEG_D1: &str = r"\*\*(?P<eid>.+)\.\*\*";
+static REGEX_SEG_D2: &str = r"^((\*)|(\*\*))(?(2)\(|)(?P<eid>[a-zA-Z0-9]+)(?(2)\)\*|\.\*\*)$"; // <-- requires use of fancy-regex; isolated is r"\*\((?P<eid>.+)\)\*";
 static REGEX_DECL_VALID: &str = r"\\newcommand\{\\(?P<id>[a-z]+)}(\[(?P<pc>\d+)])?\{(?P<macro>.*)}";
 static REGEX_DECL_INVALID: &str = r"\\newcommand\{\\(?P<id>.+)}(\[(?P<pc>.+)])?\{(?P<macro>.*)}";
 static REGEX_DECL_ID: &str = r"\\newcommand\{\\(?P<id>[a-z]+)}(\[\d+])?\{.*}";
+
+//static REGEX_EID_LAYERS: [&str; 3] = [r"(?P<eid>\d+\.", r"\((?P<eid>[a-z]+))", r"\((?P<eid>["]
 
 static CLASS_DEFAULT: &str = "Math 3345";
 static META_DEFAULT: &str = "MWF 1:50-2:45, Katz";
@@ -24,6 +27,7 @@ static AUTHOR_DEFAULT: &str = "Lucas Xie";
 static PATH_DECLS: &str = "decls.yaml";
 static PATH_TEMPLATE: &str = "template.tex";
 static NO_MATCH: &str = "";
+
 // static EID_LAYERS: (char, char, char) = ('1', 'a', 'i') <-- TODO i increments by roman numeral instead...
 
 pub struct MarkdownDoc {
@@ -38,6 +42,7 @@ pub struct MarkdownDoc {
 // }
 
 pub struct Segment {
+    eid: String,
     content: Either<Vec<Segment>, String>, // assume (a)...(z) then 1. to $LEN., bound by italic
 }
 
@@ -45,11 +50,11 @@ impl Segment {
     fn compile(&self, mut eid: char) -> String {
         match &self.content {
             Left(segs) => {
-                eid = char::from_u32(eid as u32 + ('a' as u32 - '1' as u32)).unwrap(); // calc next starting EID?? pedantic?
+                let mut eid2 = char::from_u32(eid as u32 + ('a' as u32 - '1' as u32)).unwrap(); // calc next starting EID?? pedantic?
                 let con = segs.iter().map(|s| {
                     // note: this is assuming depth of 2 (meaning subsegs guaranteed to not be Left(segs). May need to do some recursive magic here in regards to \begin{enum}...!
-                    let comp = s.compile(eid);
-                    eid = char::from_u32(eid as u32 + 1).unwrap(); // increment EID
+                    let comp = s.compile(eid2);
+                    eid2 = char::from_u32(eid2 as u32 + 1).unwrap(); // increment EID
                     comp
                 }).collect::<Vec<String>>().join("\n");
 
@@ -139,25 +144,28 @@ impl MarkdownDoc {
         // Parse segments. Depth of 2 for now.
         let mut segs: Vec<Segment> = Vec::new();
         //let (mut eid1, mut eid2) = (1, 'a');
-        let (reg1, reg2) = (Regex::new(REGEX_SEG_D1).unwrap(), Regex::new(REGEX_SEG_D2).unwrap());
+        let re1 = Regex::new(REGEX_SEG_D1).unwrap();
+        let re2 = regmerge(&Regex::new(REGEX_SEG_D2).unwrap(), &re1);
 
         while let Some(_) = content.peek() {
             let seg = {
-                while !reg1.is_match(&content.next().unwrap()) {}; // <-- jump until (after) seg depth=1 tag
+                let eid = {
+                    while let Some(_) = content.next_if(|l| !re1.is_match(l)) {} // <-- jump until (before) seg depth=1 tag
+                    regextract(&re1, &content.next().unwrap(), "eid").unwrap()
+                };
 
                 // Check if subsegs are present... (a), (b), etc etc
-                if reg2.is_match(&content.next().unwrap()) {
-                    //eid2 = 'a';
+                if re2.is_match(&content.peek().unwrap()) {
                     let mut subsegs: Vec<Segment> = Vec::new();
 
-                    while content.peek().is_some() && !reg1.is_match(content.peek().unwrap()) { // <-- must check for EOF
-                        subsegs.push(consume_segment(&mut content, &reg2));
-                        content.next_if(|l| !reg1.is_match(l));
+                    while content.peek().is_some_and(|c| !re1.is_match(c)) { // <-- must check for EOF!
+                        subsegs.push(consume_segment(&mut content, &re2));
+                      //  content.next_if(|l| !re1.is_match(l));
                     }
 
-                    Segment { content: Left(subsegs) }
+                    Segment { eid, content: Left(subsegs) }
                 } else {
-                    consume_segment(&mut content, &reg1)
+                    consume_segment(&mut content, &re1)
                 }
             };
 
@@ -308,13 +316,60 @@ fn query(msg: &str) -> String {
     bfr.trim().to_string()
 }
 
+/// Consumes a segment; note that the immediate next token should be the string containing EID.
 fn consume_segment<I: Iterator<Item = String>>(content: &mut Peekable<I>, delim: &Regex) -> Segment {
     let mut body = String::new();
+    let eid = regextract(delim, &content.next().unwrap(), "eid").unwrap();
+
     while let Some(line) = content.next_if(|l| !delim.is_match(l)) {
-        body.push_str(&line);
+        if line.is_empty() {
+            body.push_str("\\\\\n\n")
+        } else {
+            body.push_str(&line);
+            body.push('\n');
+        }
     }
 
-    Segment { content: Right(body) }
+    Segment { eid, content: Right(body) }
+}
+
+fn regextract(re: &Regex, haystack: &str, id: &str) -> Option<String> {
+    let caps = re.captures(haystack);
+    caps.and_then(|c| Some(c[id].to_string()))
+}
+
+/// This only works with regex with one (1) named capture group. Also naive implem as groups could already be named numerically (e.g. pat1 -> pat11).
+fn regmerge(re1: &Regex, re2: &Regex) -> Regex {
+    let meta_re = Regex::new(REGEX_META_NCAP).unwrap();
+    let (mut str1, mut str2) = (re1.to_string(), re2.to_string());
+    let (caps1, caps2) = (meta_re.captures(&str1), meta_re.captures(&str2));
+    let symcheck = {
+        let (nc1, nc2) = (caps1.and_then(|c| Some(c.name("ncap").unwrap().as_str().to_string())), caps2.and_then(|c| Some(c.name("ncap").unwrap().as_str().to_string())));
+        nc1.and_then(|c1|
+            if nc2.is_some_and(|c2| c1 == c2) {
+                Some(c1)
+            } else {
+                None
+            }
+        )
+    };
+
+    if let Some(ncap) = symcheck { // <-- if both captured ncaps have same identifier...
+        str1 = str1.replace(&ncap, &format!("{}1", ncap));
+        str2 = str2.replace(&ncap, &format!("{}2", ncap));
+    }
+
+    Regex::new(&format!(r"({})|({})", str1, str2)).unwrap()
+}
+
+/// Send contents to clipboard.
+pub fn to_clipboard(contents: &str) {
+    let mut pbcopy = Command::new("pbcopy")
+        .stdin(Stdio::piped())
+        .spawn().unwrap();
+
+    pbcopy.stdin.as_mut().unwrap().write_all(contents.as_bytes()).unwrap();
+    pbcopy.wait().unwrap();
 }
 
 #[cfg(test)]
@@ -339,5 +394,14 @@ mod tests {
         let decl2 = decl2yaml(yaml2);
 
         println!("{}", decl2.is_ok())
+    }
+
+    #[test]
+    fn regex() {
+        let (re1, re2) = (Regex::new(REGEX_SEG_D1).unwrap(), Regex::new(REGEX_SEG_D2).unwrap());
+        assert!(re1.is_match("**1.**"));
+        assert!(!re1.is_match("jiawejifajweifjaiwejf"));
+        assert!(re2.is_match("*(a)*"));
+        assert!(!re2.is_match("**1.**"));
     }
 }
