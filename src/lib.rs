@@ -4,17 +4,18 @@ use std::fs::{File, OpenOptions};
 use std::io::{stdin, stdout, BufRead, BufReader, BufWriter, Write};
 
 use chrono::{Datelike, Local};
-use regex::Regex;
+use fancy_regex::Regex;
 use std::iter::Peekable;
-use std::ops::Deref;
 use std::process::{Command, Stdio};
 use yaml_rust::{yaml, Yaml, YamlEmitter, YamlLoader};
 
 type TeXContent = String;
 
+static ORNAMENT_ANCHOR: &str = "{}";
 static REGEX_META_NCAP: &str = r".*\(\?P<(?P<ncap>.+)>.*\).*"; // <-- note, this means only limited to one named capture group for regmerge!
 static REGEX_SEG_D1: &str = r"\*\*(?P<eid>.+)\.\*\*";
-static REGEX_SEG_D2: &str = r"^((\*)|(\*\*))(?(2)\(|)(?P<eid>[a-zA-Z0-9]+)(?(2)\)\*|\.\*\*)$"; // <-- requires use of fancy-regex; isolated is r"\*\((?P<eid>.+)\)\*";
+static REGEX_SEG_D2: &str = r"\*\((?P<eid>.+)\)\*";
+static REGEX_SEG_ANY: &str = r"^((\*)|(\*\*))(?(2)\(|)(?P<eid>[a-zA-Z0-9]+)(?(2)\)\*|\.\*\*)$"; // <-- requires use of fancy-regex;
 static REGEX_DECL_VALID: &str = r"\\newcommand\{\\(?P<id>[a-z]+)}(\[(?P<pc>\d+)])?\{(?P<macro>.*)}";
 static REGEX_DECL_INVALID: &str = r"\\newcommand\{\\(?P<id>.+)}(\[(?P<pc>.+)])?\{(?P<macro>.*)}";
 static REGEX_DECL_ID: &str = r"\\newcommand\{\\(?P<id>[a-z]+)}(\[\d+])?\{.*}";
@@ -41,26 +42,53 @@ pub struct MarkdownDoc {
 //
 // }
 
+pub struct Label { // <-- e.g. (1), ii., <hr>5</hr>
+    ident: String,   // raw value; 1
+    ornament: String // outside wrapper; ({}) TODO best to make ornament a ref?
+}
+
+impl Label {
+    fn new(ident: String, ornament: String) -> Label {
+        assert!(ornament.contains(ORNAMENT_ANCHOR) && ornament.replacen(ORNAMENT_ANCHOR, "", 1).contains(ORNAMENT_ANCHOR), "Ornament must contain only one anchor");
+        Label { ident, ornament }
+    }
+
+    fn from(str: String) -> Label {
+        // note: the label string must distinguish ident and ornament by wrapping ident with {}.
+        // e.g.: "({a})" or "{3}."
+        // format: [ornament half] { [ident] } [ornament half]
+
+        let spl = str.split(['{', '}']).collect::<Vec<&str>>();
+        let ident: String = spl[1].to_string();
+        let ornament: String = format!("{}{{}}{}", spl[0], spl[2]);
+
+        Label { ident, ornament }
+    }
+
+    fn compile(&self) -> String {
+        self.ornament.replace(ORNAMENT_ANCHOR, &self.ident)
+    }
+}
+
 pub struct Segment {
-    eid: String,
+    eid: Label,
     content: Either<Vec<Segment>, String>, // assume (a)...(z) then 1. to $LEN., bound by italic
 }
 
 impl Segment {
-    fn compile(&self, mut eid: char) -> String {
+    fn compile(&self) -> String {
+        let eid = &self.eid.compile();
+
         match &self.content {
             Left(segs) => {
-                let mut eid2 = char::from_u32(eid as u32 + ('a' as u32 - '1' as u32)).unwrap(); // calc next starting EID?? pedantic?
-                let con = segs.iter().map(|s| {
-                    // note: this is assuming depth of 2 (meaning subsegs guaranteed to not be Left(segs). May need to do some recursive magic here in regards to \begin{enum}...!
-                    let comp = s.compile(eid2);
-                    eid2 = char::from_u32(eid2 as u32 + 1).unwrap(); // increment EID
-                    comp
-                }).collect::<Vec<String>>().join("\n");
+                let con = segs.iter()
+                    .map(Segment::compile)
+                    .collect::<Vec<String>>()
+                    .join("\n");
 
-                format!("\\item[{}.]\n\\begin{{enumerate}}{}\\end{{enumerate}}", eid, con)
+                format!("\\item[{}]\n\\begin{{enumerate}}{}\\end{{enumerate}}\\sq\\sq", eid, con)
             },
-            Right(con) => format!("\\item[{}.]\n{}", eid, con)
+            Right(con) => format!("\\item[{}]\n{}\\sq\\sq", eid, con)
         }
     }
 }
@@ -68,7 +96,12 @@ impl Segment {
 impl MarkdownDoc {
     pub fn new(path: &str) -> Self {
         let (file, title) = (File::open(path).expect("Could not read file"), path.split('.').next().expect("File format bad").to_string());
-        let mut content = BufReader::new(file).lines().map(|l| l.unwrap()).peekable();
+        let mut content = BufReader::new(file)
+                .lines()
+                .map(|l| l.unwrap().trim().to_string())
+                .peekable();
+
+
 
         // Note on parsing decls... strips all $ — may be problematic for decl macros that use $$, but obsitex theoretically shouldn't permit it.
 
@@ -101,7 +134,7 @@ impl MarkdownDoc {
         let re_id = Regex::new(REGEX_DECL_ID).unwrap(); // TODO temp may be better to refactor decl2yaml as decomp_decl and decl2yaml using decomp tuple
         let db_cands: Vec<&String> = hot_decls.iter()
             .filter(|&d| {
-                let caps = re_id.captures(d).unwrap();
+                let caps = re_id.captures(d).unwrap().unwrap();
                 !decl_ids.contains(&caps["id"].to_string())
             })
             .collect();
@@ -123,10 +156,10 @@ impl MarkdownDoc {
                 match decl2yaml(&cand) {
                     Ok(yaml) => {
                         cold_decls.push(yaml);
-                        println!("[OK] decl '{}' written", &cand);
+                        println!("(✔) decl '{}' written", &cand);
                     },
                     Err(msg) => {
-                        eprintln!("[ERR] decl '{}' not written, {}", &cand, msg);
+                        eprintln!("(X) decl '{}' not written, {}", &cand, msg);
                     }
                 }
             }
@@ -144,28 +177,26 @@ impl MarkdownDoc {
         // Parse segments. Depth of 2 for now.
         let mut segs: Vec<Segment> = Vec::new();
         //let (mut eid1, mut eid2) = (1, 'a');
-        let re1 = Regex::new(REGEX_SEG_D1).unwrap();
-        let re2 = regmerge(&Regex::new(REGEX_SEG_D2).unwrap(), &re1);
+        let (re1, re2, re0) = (Regex::new(REGEX_SEG_D1).unwrap(), Regex::new(REGEX_SEG_D2).unwrap(), Regex::new(REGEX_SEG_ANY).unwrap());
 
         while let Some(_) = content.peek() {
             let seg = {
-                let eid = {
-                    while let Some(_) = content.next_if(|l| !re1.is_match(l)) {} // <-- jump until (before) seg depth=1 tag
-                    regextract(&re1, &content.next().unwrap(), "eid").unwrap()
-                };
+                while let Some(_) = content.next_if(|l| !re1.is_match(l).unwrap()) {} // <-- jump until (before) seg depth=1 tag
+                let eid1 = Label::from(format!("{{{}}}.", consume_eid(&mut content, &re1).unwrap()));
 
                 // Check if subsegs are present... (a), (b), etc etc
-                if re2.is_match(&content.peek().unwrap()) {
+                if re2.is_match(&content.peek().unwrap()).unwrap() {
                     let mut subsegs: Vec<Segment> = Vec::new();
 
-                    while content.peek().is_some_and(|c| !re1.is_match(c)) { // <-- must check for EOF!
-                        subsegs.push(consume_segment(&mut content, &re2));
+                    while content.peek().is_some_and(|c| !re1.is_match(c).unwrap()) { // <-- must check for EOF!
+                        let eid2 = Label::from(format!("({{{}}})", consume_eid(&mut content, &re2).unwrap()));
+                        subsegs.push(consume_segment(&mut content, &re0, eid2));
                       //  content.next_if(|l| !re1.is_match(l));
                     }
 
-                    Segment { eid, content: Left(subsegs) }
+                    Segment { eid: eid1, content: Left(subsegs) }
                 } else {
-                    consume_segment(&mut content, &re1)
+                    consume_segment(&mut content, &re1, eid1)
                 }
             };
 
@@ -188,7 +219,10 @@ impl MarkdownDoc {
         };
 
         let mut template = fs::read_to_string(PATH_TEMPLATE).expect("Could not read template");
-        let content = self.segs.iter().map(|s| s.compile('1')).collect::<Vec<String>>().join("\n");
+        let content = self.segs.iter()
+            .map(Segment::compile)
+            .collect::<Vec<String>>()
+            .join("\n");
         let time = {
             let now = Local::now();
             format!("{} {}, {}", monthize(now.month() as u8), ordinize(now.day() as u8), now.year())
@@ -286,7 +320,7 @@ fn parse_decls(yamls: &Yaml) -> String {
 fn decl2yaml(decl: &str) -> Result<Yaml, String> {
     // decl format is "\newcommand{\$ID}{$MACRO}" or "\newcommand{\$ID}[$PC]{$MACRO}}"
     let (re_valid, re_invalid) = (Regex::new(REGEX_DECL_VALID).unwrap(), Regex::new(REGEX_DECL_INVALID).unwrap());
-    let (caps_valid, caps_invalid) = (re_valid.captures(decl), re_invalid.captures(decl));
+    let (caps_valid, caps_invalid) = (re_valid.captures(decl).unwrap(), re_invalid.captures(decl).unwrap());
 
     match (caps_valid, caps_invalid) {
         (Some(caps), _) if caps.len() == 5 => { // <-- note that this is (1) full capture, (1) [$ID] opt group, (3) needed values.
@@ -316,25 +350,31 @@ fn query(msg: &str) -> String {
     bfr.trim().to_string()
 }
 
-/// Consumes a segment; note that the immediate next token should be the string containing EID.
-fn consume_segment<I: Iterator<Item = String>>(content: &mut Peekable<I>, delim: &Regex) -> Segment {
+/// Consumes a segment; cannot guarantee that immediate next token contains EID so must manually pass EID.
+fn consume_segment<I: Iterator<Item = String>>(content: &mut Peekable<I>, delim: &Regex, eid: Label) -> Segment {
     let mut body = String::new();
-    let eid = regextract(delim, &content.next().unwrap(), "eid").unwrap();
+    let mut has_final = false;
+    //let eid = regextract(delim, &content.next().unwrap(), "eid").unwrap();
 
-    while let Some(line) = content.next_if(|l| !delim.is_match(l)) {
+    while let Some(line) = content.next_if(|l| !delim.is_match(l).unwrap()) {
         if line.is_empty() {
             body.push_str("\\\\\n\n")
         } else {
             body.push_str(&line);
-            body.push('\n');
+            body.push_str("\n");
         }
     }
 
     Segment { eid, content: Right(body) }
 }
 
+// Consume EID from the immediate following token. May require other operations in future hence separation.
+fn consume_eid<I: Iterator<Item = String>>(content: &mut I, re: &Regex) -> Option<String> {
+    regextract(re, &content.next().unwrap(), "eid")
+}
+
 fn regextract(re: &Regex, haystack: &str, id: &str) -> Option<String> {
-    let caps = re.captures(haystack);
+    let caps = re.captures(haystack).unwrap();
     caps.and_then(|c| Some(c[id].to_string()))
 }
 
@@ -342,7 +382,7 @@ fn regextract(re: &Regex, haystack: &str, id: &str) -> Option<String> {
 fn regmerge(re1: &Regex, re2: &Regex) -> Regex {
     let meta_re = Regex::new(REGEX_META_NCAP).unwrap();
     let (mut str1, mut str2) = (re1.to_string(), re2.to_string());
-    let (caps1, caps2) = (meta_re.captures(&str1), meta_re.captures(&str2));
+    let (caps1, caps2) = (meta_re.captures(&str1).unwrap(), meta_re.captures(&str2).unwrap());
     let symcheck = {
         let (nc1, nc2) = (caps1.and_then(|c| Some(c.name("ncap").unwrap().as_str().to_string())), caps2.and_then(|c| Some(c.name("ncap").unwrap().as_str().to_string())));
         nc1.and_then(|c1|
@@ -382,7 +422,7 @@ mod tests {
         let yaml1 = r"\newcommand{\comm}[1]{\;\text{#1}\;}";
         let yaml2 = r"\newcommand{\zq}{\phantom{}^2}";
 
-        let caps = re1.captures(yaml2).unwrap();
+        let caps = re1.captures(yaml2).unwrap().unwrap();
         let len = caps.len();
 
         for i in 0..len {
@@ -398,10 +438,11 @@ mod tests {
 
     #[test]
     fn regex() {
-        let (re1, re2) = (Regex::new(REGEX_SEG_D1).unwrap(), Regex::new(REGEX_SEG_D2).unwrap());
-        assert!(re1.is_match("**1.**"));
-        assert!(!re1.is_match("jiawejifajweifjaiwejf"));
-        assert!(re2.is_match("*(a)*"));
-        assert!(!re2.is_match("**1.**"));
+        let (re1, re2) = (Regex::new(REGEX_SEG_D1).unwrap(), Regex::new(REGEX_SEG_ANY).unwrap());
+        assert!(re1.is_match("**1.**").unwrap());
+        assert!(!re1.is_match("jiawejifajweifjaiwejf").unwrap());
+        assert!(re2.is_match("*(a)*").unwrap());
+        assert!(re2.is_match("**1.**").unwrap());
+        assert!(!re2.is_match("*(a)**").unwrap());
     }
 }

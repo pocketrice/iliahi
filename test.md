@@ -1,6 +1,9 @@
 
 $\newcommand{\comm}[1]{\;\text{#1}\;}$
 $\newcommand{\zq}{\phantom{}^2}$
+\newcommand{\nq}{\vspace{1cm}\\}
+\newcommand{\sq}{\sqe\\}
+\newcommand{\sqe}{\vspace{0.3cm}}
 
 **1.**
 *(a)* 
