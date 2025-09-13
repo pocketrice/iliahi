@@ -248,3 +248,12 @@
 - id: zq
   macro: "\\phantom{}^2"
   pc: 0
+- id: nq
+  macro: "\\vspace{1cm}\\\\"
+  pc: 0
+- id: sq
+  macro: "\\sqe\\\\"
+  pc: 0
+- id: sqe
+  macro: "\\vspace{0.3cm}"
+  pc: 0
