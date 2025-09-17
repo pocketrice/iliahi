@@ -19,6 +19,8 @@ static REGEX_SEG_ANY: &str = r"^((\*)|(\*\*))(?(2)\(|)(?P<eid>[a-zA-Z0-9]+)(?(2)
 static REGEX_DECL_VALID: &str = r"\\newcommand\{\\(?P<id>[a-z]+)}(\[(?P<pc>\d+)])?\{(?P<macro>.*)}";
 static REGEX_DECL_INVALID: &str = r"\\newcommand\{\\(?P<id>.+)}(\[(?P<pc>.+)])?\{(?P<macro>.*)}";
 static REGEX_DECL_ID: &str = r"\\newcommand\{\\(?P<id>[a-z]+)}(\[\d+])?\{.*}";
+static REGEX_USES_FINAL: &str = r".*(\\finalans\{.+\}).*";
+static REGEX_USES_QQ: &str = r"^(\$(\\(q+|[;,>:]|(hspace)))+)(?<nq>.+)\$$";
 
 //static REGEX_EID_LAYERS: [&str; 3] = [r"(?P<eid>\d+\.", r"\((?P<eid>[a-z]+))", r"\((?P<eid>["]
 
@@ -43,6 +45,7 @@ pub struct MarkdownDoc {
 // macro_rules! tex_decl { <-- relic of using technique of actually replacing placeholders in content... no need!
 //
 // }
+
 
 pub struct Label { // <-- e.g. (1), ii., <hr>5</hr>
     ident: String,   // raw value; 1
@@ -88,9 +91,9 @@ impl Segment {
                     .collect::<Vec<String>>()
                     .join("\n");
 
-                format!("\\item[{}]\n\\begin{{enumerate}}{}\\end{{enumerate}}\\sq\\sq", eid, con)
+                format!("\\item[{}]\n\\begin{{enumerate}}{}\\end{{enumerate}}\\sq", eid, con)
             },
-            Right(con) => format!("\\item[{}]\n{}\\sq\\sq", eid, con)
+            Right(con) => format!("\\item[{}]\n{}\\sq", eid, con)
         }
     }
 }
@@ -102,7 +105,6 @@ impl MarkdownDoc {
                 .lines()
                 .map(|l| l.unwrap().trim().to_string())
                 .peekable();
-
 
 
         // Note on parsing decls... strips all $ — may be problematic for decl macros that use $$, but obsitex theoretically shouldn't permit it.
@@ -119,12 +121,18 @@ impl MarkdownDoc {
                     .unwrap()
             }).collect();
 
+        // >NEW< change since a9d665b!
+        // Making local decl parsing more forgiving by simply skipping all non-decl content.
+        // This is also great for leaving some space for quick notes and things that will not be processed! Win-win!~
         let mut hot_decls = {
             let mut decls: Vec<String> = Vec::new();
+            let (re_decl, re_heading) = (Regex::new(REGEX_DECL_VALID).unwrap(), Regex::new(REGEX_SEG_D1).unwrap());
 
-            while let Some(_) = content.next_if(|l| l.is_empty()) {}; // <-- skip initial blanks
-            while let Some(decl) = content.next_if(|l| !l.is_empty()) { // <-- read until final blank
-                decls.push(decl.replace("$", ""));
+            while let Some(line) = content.next_if(|l| !re_heading.is_match(l).unwrap()) {
+                let mod_line = line.replace("$", "");
+                if re_decl.is_match(&mod_line).unwrap() {
+                    decls.push(mod_line)
+                }
             }
 
             decls
@@ -407,15 +415,42 @@ fn query(msg: &str) -> String {
 /// Consumes a segment; cannot guarantee that immediate next token contains EID so must manually pass EID.
 fn consume_segment<I: Iterator<Item = String>>(content: &mut Peekable<I>, delim: &Regex, eid: Label) -> Segment {
     let mut body = String::new();
+    let (re_qq, re_final) = (Regex::new(REGEX_USES_QQ).unwrap(), Regex::new(REGEX_USES_FINAL).unwrap());
     let mut has_final = false;
+
     //let eid = regextract(delim, &content.next().unwrap(), "eid").unwrap();
 
-    while let Some(line) = content.next_if(|l| !delim.is_match(l).unwrap()) {
-        if line.is_empty() {
-            body.push_str("\\\\\n\n")
-        } else {
-            body.push_str(&line);
-            body.push_str("\n");
+    while let Some(mut line) = content.next_if(|l| !delim.is_match(l).unwrap()) {
+        if !has_final && re_final.is_match(&line).unwrap() { // a Oncelet would be good here, but unfort cannot short-circuit within trigger(cond) :c
+            has_final = true;
+        }
+
+        let nq_cand = re_qq.captures(&line).unwrap().and_then(|caps| Some(&caps["nq"]));
+
+        if !has_final && content.peek().is_some_and(|l| delim.is_match(l).unwrap()) { // <-- TODO this isn't efficient (match 2x); find some way to match 1x??
+            if let Some(nq) = nq_cand {
+                uproot(&mut line, "$\\finalans{{${}$}}", nq);
+            } else {
+                line.insert_str(0, "\\finalans{");
+                line.push('}');
+            }
+
+        }
+
+        match line {
+            l if l.is_empty() => {
+                body.push_str("\\\\\n");
+            },
+
+            l if nq_cand.is_some() => {
+                body.push_str("\\\n\n");
+                body.push_str(&l);
+            },
+
+            l => {
+                body.push_str("\\\n");
+                body.push_str(&l);
+            }
         }
     }
 
@@ -501,6 +536,38 @@ pub fn to_clipboard(contents: &str) {
     pbcopy.stdin.as_mut().unwrap().write_all(contents.as_bytes()).unwrap();
     pbcopy.wait().unwrap();
 }
+
+pub fn str_count(haystack: &str, needle: &str) -> usize {
+    haystack.match_indices(needle).count()
+}
+
+/// "Uproot" piece in string if present and apply ornaments in-place.
+/// The format string must contain only one instance of the placeholder string ({}).
+///
+/// # Caveats
+/// This is not 100% fmtstr-compliant as "{{}}" will not be recognized as
+/// escaping into "{}". This is intentional.
+pub fn uproot(haystack: &mut str, fmtstr: &str, needle: &str) {
+    assert_eq!(str_count(&fmtstr, "{}"), 1, "Format string must include only one placeholder!");
+
+    if let Some((start, end)) = haystack.match_indices(needle).next().and_then(|(i,item)| Some((i, i + item.len()))) {
+        let (orna_s, orna_e) = {
+            let mut ornaments = fmtstr.split("{}");
+            (ornaments.next().unwrap_or(""), ornaments.next().unwrap_or(""))
+        };
+
+        let mut haystack = haystack.into_string();
+        haystack.insert_str(start-1, orna_s);
+        haystack.insert_str(end, orna_e);
+    }
+}
+
+/// "Uproot" piece in string if present and apply ornaments in-place. <-- unfort a proc macro is needed to modify variables? (https://stackoverflow.com/questions/71812185/is-there-a-way-to-make-a-macro-replace-things-in-strings)
+// macro_rules! uproot {
+//     ($haystack:expr, $fmt:expr, $needle:expr) => {{
+//         $haystack = $haystack.as_mut_str().replace(format!($fmt, $needle));
+//     }};
+// }
 
 #[cfg(test)]
 mod tests {
