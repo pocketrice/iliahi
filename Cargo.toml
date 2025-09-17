@@ -1,0 +1,10 @@
+[package]
+name = "iliahi"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+fancy-regex = "0.16.1"
+yaml-rust = { version = "0.10.3", package = "yaml-rust2" }
+either = "1.15.0"
+chrono = "0.4.42"

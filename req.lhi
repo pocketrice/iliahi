@@ -1,7 +1,7 @@
 ## Answer boxing
-
 \newcommand{\finalans}[1]{\fcolorbox{black}{final}{\begin{varwidth}{12cm}#1\end{varwidth}}}
 \newcommand{\partans}[1]{\fcolorbox{black}{white}{\begin{varwidth}{12cm}#1\end{varwidth}}}
+\definecolor{final}{HTML}{e2e2e2}
 
 ## In-line spacers
 \newcommand{\qqqqq}{\qqqq\q}
