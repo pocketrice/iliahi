@@ -6,12 +6,14 @@ use std::io::{stdin, stdout, BufRead, BufReader, Write};
 use chrono::{Datelike, Local};
 use fancy_regex::{Captures, Regex};
 use std::iter::Peekable;
+use std::ops::{Index, RangeBounds};
 use std::process::{Command, Stdio};
+use std::slice::SliceIndex;
 use yaml_rust::{yaml, Yaml, YamlEmitter, YamlLoader};
 
 type TeXContent = String;
 
-static ORNAMENT_ANCHOR: &str = "{}";
+static FMT_ANCHOR: &str = "{}";
 static REGEX_META_NCAP: &str = r".*\(\?P<(?P<ncap>.+)>.*\).*"; // <-- note, this means only limited to one named capture group for regmerge!
 static REGEX_SEG_D1: &str = r"\*\*(?P<eid>.+)\.\*\*";
 static REGEX_SEG_D2: &str = r"\*\((?P<eid>.+)\)\*";
@@ -20,7 +22,8 @@ static REGEX_DECL_VALID: &str = r"\\newcommand\{\\(?P<id>[a-z]+)}(\[(?P<pc>\d+)]
 static REGEX_DECL_INVALID: &str = r"\\newcommand\{\\(?P<id>.+)}(\[(?P<pc>.+)])?\{(?P<macro>.*)}";
 static REGEX_DECL_ID: &str = r"\\newcommand\{\\(?P<id>[a-z]+)}(\[\d+])?\{.*}";
 static REGEX_USES_FINAL: &str = r".*(\\finalans\{.+\}).*";
-static REGEX_USES_QQ: &str = r"^(\$(\\(q+|[;,>:]|(hspace)))+)(?<nq>.+)\$$";
+static REGEX_USES_QQ: &str = r"((\\(q+|[;,>:]|(hspace)))*)(?<nq>.+)";
+// static REGEX_QQ: &str = r"(\\(q+|[;,>:]|(hspace)))";
 
 //static REGEX_EID_LAYERS: [&str; 3] = [r"(?P<eid>\d+\.", r"\((?P<eid>[a-z]+))", r"\((?P<eid>["]
 
@@ -49,29 +52,35 @@ pub struct MarkdownDoc {
 
 pub struct Label { // <-- e.g. (1), ii., <hr>5</hr>
     ident: String,   // raw value; 1
-    ornament: String // outside wrapper; ({}) TODO best to make ornament a ref?
+    ornament: FmtStr // outside wrapper; ({})
 }
 
 impl Label {
-    fn new(ident: String, ornament: String) -> Label {
-        assert!(ornament.contains(ORNAMENT_ANCHOR) && !ornament.replacen(ORNAMENT_ANCHOR, "", 1).contains(ORNAMENT_ANCHOR), "Ornament must contain only one anchor");
-        Label { ident, ornament }
+    fn new(ident: String, ornament: String) -> Result<Label, ()> {
+        match FmtStr::from(&ornament) {
+            Ok(fmts) => Ok(Label { ident, ornament: fmts }),
+            Err(_) => Err(()),
+        }
     }
 
-    fn from(str: String) -> Label {
+    fn from(str: String) -> Result<Label, ()> {
         // note: the label string must distinguish ident and ornament by wrapping ident with {}.
         // e.g.: "({a})" or "{3}."
         // format: [ornament half] { [ident] } [ornament half]
 
         let spl = str.split(['{', '}']).collect::<Vec<&str>>();
-        let ident: String = spl[1].to_string();
-        let ornament: String = format!("{}{{}}{}", spl[0], spl[2]);
+        if let [orna_l, ident, orna_r] = spl[0..3] {
+            let ornament: String = format!("{}{{}}{}", orna_l, orna_r);
 
-        Label { ident, ornament }
+            Ok(Label::new(ident.to_string(), ornament)?)
+        } else {
+            Err(())
+        }
+
     }
 
     fn compile(&self) -> String {
-        self.ornament.replace(ORNAMENT_ANCHOR, &self.ident)
+        self.ornament.fmt(&self.ident)
     }
 }
 
@@ -95,6 +104,46 @@ impl Segment {
             },
             Right(con) => format!("\\item[{}]\n{}\\sq", eid, con)
         }
+    }
+}
+
+pub struct FmtStr { // <-- called FmtString? FmtStr? temporarily only accepts one anchor b/c format!() exists.
+    orna_l: String,
+    orna_h: String
+}
+
+impl FmtStr {
+    pub fn new(left: &str, right: &str) -> FmtStr {
+        FmtStr { orna_l: left.to_string(), orna_h: right.to_string() }
+    }
+
+    pub fn from(fmt_str: &str) -> Result<FmtStr, ()> {
+        if fmt_str.contains(FMT_ANCHOR) {
+            let (orna_l, orna_h) = fmt_str.split_once(FMT_ANCHOR).unwrap();
+            Ok(FmtStr::new(orna_l, orna_h))
+        } else {
+            Err(())
+        }
+    }
+
+    pub fn fmt(&self, anchor: &dyn ToString) -> String {
+        let mut res = String::from(&self.orna_l);
+        res.push_str(&anchor.to_string());
+        res.push_str(&self.orna_h);
+
+        res
+    }
+
+    pub fn len(&self) -> usize {
+        self.orna_l.len() + self.orna_h.len()
+    }
+
+    pub fn raw(&self) -> String {
+        let mut res = String::from(&self.orna_l);
+        res.push_str(FMT_ANCHOR);
+        res.push_str(&self.orna_h);
+
+        res
     }
 }
 
@@ -183,13 +232,13 @@ impl MarkdownDoc {
 
                     while content.peek().is_some_and(|c| !re1.is_match(c).unwrap()) { // <-- must check for EOF!
                         let eid2 = Label::from(format!("({{{}}})", consume_eid(&mut content, &re2).unwrap()));
-                        subsegs.push(consume_segment(&mut content, &re0, eid2));
+                        subsegs.push(consume_segment(&mut content, &re0, eid2.unwrap()));
                       //  content.next_if(|l| !re1.is_match(l));
                     }
 
-                    Segment { eid: eid1, content: Left(subsegs) }
+                    Segment { eid: eid1.unwrap(), content: Left(subsegs) }
                 } else {
-                    consume_segment(&mut content, &re1, eid1)
+                    consume_segment(&mut content, &re1, eid1.unwrap())
                 }
             };
 
@@ -421,36 +470,39 @@ fn consume_segment<I: Iterator<Item = String>>(content: &mut Peekable<I>, delim:
     //let eid = regextract(delim, &content.next().unwrap(), "eid").unwrap();
 
     while let Some(mut line) = content.next_if(|l| !delim.is_match(l).unwrap()) {
-        if !has_final && re_final.is_match(&line).unwrap() { // a Oncelet would be good here, but unfort cannot short-circuit within trigger(cond) :c
-            has_final = true;
-        }
+        has_final &= re_final.is_match(&line).unwrap(); // <-- tried to make a Oncelet, but turns out bit-AND is just that.
 
-        let nq_cand = re_qq.captures(&line).unwrap().and_then(|caps| Some(&caps["nq"]));
+        let nq = regextract(&re_qq, &line, "nq").unwrap_or(String::new());
+        let is_qq = nq.len() < line.len();
 
-        if !has_final && content.peek().is_some_and(|l| delim.is_match(l).unwrap()) { // <-- TODO this isn't efficient (match 2x); find some way to match 1x??
-            if let Some(nq) = nq_cand {
-                uproot(&mut line, "$\\finalans{{${}$}}", nq);
-            } else {
-                line.insert_str(0, "\\finalans{");
-                line.push('}');
-            }
-
-        }
-
-        match line {
+        let mut append = match &line {
             l if l.is_empty() => {
-                body.push_str("\\\\\n");
+                String::from("\\\\\n")
             },
 
-            l if nq_cand.is_some() => {
-                body.push_str("\\\n\n");
-                body.push_str(&l);
+            l if is_qq => {
+                format!("\\\\\n\n{}", &l).to_string()
             },
 
             l => {
-                body.push_str("\\\n");
-                body.push_str(&l);
+                format!("\\\\\n{}", &l).to_string()
             }
+        };
+
+        if !has_final && content.peek().is_some_and(|l| delim.is_match(l).unwrap()) {
+            let fmst = FmtStr::new("\\finalans{", "}");
+            if line.is_empty() {
+                let (prev_pos, _) = body.rmatch_indices('\n').next().unwrap();
+                let prev_nq = regextract(&re_qq, &body[prev_pos..], "nq").unwrap();
+                let seg_range = (body.len() - prev_nq.len())..;
+                segpend(&mut body, seg_range, &fmst);
+            } else {
+                let seg_range = (append.len() - line.len())..;
+                segpend(&mut append, seg_range, &fmst);
+                body.push_str(&append);
+            };
+        } else {
+            body.push_str(&append); // todo refactor so add is_empty to append
         }
     }
 
@@ -547,7 +599,7 @@ pub fn str_count(haystack: &str, needle: &str) -> usize {
 /// # Caveats
 /// This is not 100% fmtstr-compliant as "{{}}" will not be recognized as
 /// escaping into "{}". This is intentional.
-pub fn uproot(haystack: &mut str, fmtstr: &str, needle: &str) {
+pub fn uproot(haystack: &mut String, fmtstr: &str, needle: &str) {
     assert_eq!(str_count(&fmtstr, "{}"), 1, "Format string must include only one placeholder!");
 
     if let Some((start, end)) = haystack.match_indices(needle).next().and_then(|(i,item)| Some((i, i + item.len()))) {
@@ -556,7 +608,6 @@ pub fn uproot(haystack: &mut str, fmtstr: &str, needle: &str) {
             (ornaments.next().unwrap_or(""), ornaments.next().unwrap_or(""))
         };
 
-        let mut haystack = haystack.into_string();
         haystack.insert_str(start-1, orna_s);
         haystack.insert_str(end, orna_e);
     }
@@ -569,12 +620,75 @@ pub fn uproot(haystack: &mut str, fmtstr: &str, needle: &str) {
 //     }};
 // }
 
+
+/// Takes a segment out of a string, pre-allocates size and appends modifications, puts back.
+pub fn segpend<R: RangeBounds<usize> + Clone + SliceIndex<str, Output=(str)>>(str: &mut String, seg: R, append: &FmtStr) {
+    // Extract and prepare carrier string
+    str.reserve_exact(append.len());
+    let pati = str.get(seg.clone()).unwrap();
+    str.replace_range(seg, &append.fmt(&pati));
+}
+
+
+/// Chunks string from tail and returns segment and index when regex match is found.
+///
+/// # Caveats
+/// `re` must be a non-anchored single-match pattern, as chunk may have prefixed garbage chars.
+pub fn segtil(str: &str, re: &Regex, chunk_by: usize) -> (String, usize) {
+    unimplemented!();
+}
+
+// pub fn invert_range<T: ?Sized>(range: &dyn RangeBounds<T>, len: usize) -> dyn RangeBounds<T> { <-- was thinking about libbing range inversion but seems a bit pedantic
+//
+// }
+
+/// Converts Markdown table to TeX, stripping formatting.
+/// # Examples
+/// This will convert:
+/// |  *sample*  | *type* |  *fish*  |
+/// | -------- | ---- | ------ |
+/// | $\alpha$ | 1    | trout  |
+/// | $\beta$  | S    | salmon |
+///
+/// into:
+///
+/// \begin{table}[]
+/// \begin{tabular}{|l|l|l|}
+/// \hline
+/// sample   & type & fish   \\ \hline
+/// $\alpha$ & 1    & trout  \\
+/// $\beta$  & S    & salmon \\ \hline
+/// \end{tabular}
+/// \end{table}
+///
+/// # Requires
+/// Markdown table must not contain any non-asterisk formatting (e.g. HTML tags)
+/// and must not be improperly sized (e.g. 3/3/2 table).
+
+pub fn table2tex(md: &str) -> String {
+    let mut tex = String::new();
+
+    let mut rows = md.lines().peekable();
+    let row_len = rows.peek().unwrap().len();
+
+    tex.push_str("\\begin{table}[]\n");
+    tex.push_str(&format!("\\begin{{tabular}}{{|{}}}\n", "l|".repeat(row_len)));
+    tex.push_str("\\hline\n");
+
+    
+
+    tex.push_str("\\end{tabular}\n");
+    tex.push_str("\\end{table}\n");
+
+    tex
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn decl() {
+    fn genrc_decl_parsing() {
         let (re1, re2) = (Regex::new(REGEX_DECL_VALID).unwrap(), Regex::new(REGEX_DECL_INVALID).unwrap());
         let yaml1 = r"\newcommand{\comm}[1]{\;\text{#1}\;}";
         let yaml2 = r"\newcommand{\zq}{\phantom{}^2}";
@@ -594,7 +708,7 @@ mod tests {
     }
 
     #[test]
-    fn regex() {
+    fn genrc_regex() {
         let (re1, re2) = (Regex::new(REGEX_SEG_D1).unwrap(), Regex::new(REGEX_SEG_ANY).unwrap());
         assert!(re1.is_match("**1.**").unwrap());
         assert!(!re1.is_match("jiawejifajweifjaiwejf").unwrap());
