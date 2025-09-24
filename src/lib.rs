@@ -35,6 +35,7 @@ static AUTHOR_DEFAULT: &str = "Lucas Xie";
 static PATH_DB: &str = "db.yaml";
 static PATH_TEMPLATE: &str = "template.tex";
 static NO_MATCH: &str = "";
+static LINE_BREAK: &str = "<hr>";
 
 // static EID_LAYERS: (char, char, char) = ('1', 'a', 'i') <-- TODO i increments by roman numeral instead...
 
@@ -100,9 +101,9 @@ impl Segment {
                     .collect::<Vec<String>>()
                     .join("\n");
 
-                format!("\\item[{}]\n\\begin{{enumerate}}{}\\end{{enumerate}}\\sq", eid, con)
+                format!("\\item[{}]\n\\begin{{enumerate}}{}\\end{{enumerate}}\n\\nq", eid, con)
             },
-            Right(con) => format!("\\item[{}]\n{}\\sq", eid, con)
+            Right(con) => format!("\\item[{}]\n{}\n\\nq", eid, con)
         }
     }
 }
@@ -480,6 +481,10 @@ fn consume_segment<I: Iterator<Item = String>>(content: &mut Peekable<I>, delim:
                 String::from("\\\\\n")
             },
 
+            l if l.eq(LINE_BREAK) => {
+                String::from("\\sqe\n")
+            }
+
             l if is_qq => {
                 format!("\\\\\n\n{}", &l).to_string()
             },
@@ -675,7 +680,7 @@ pub fn table2tex(md: &str) -> String {
     tex.push_str(&format!("\\begin{{tabular}}{{|{}}}\n", "l|".repeat(row_len)));
     tex.push_str("\\hline\n");
 
-    
+
 
     tex.push_str("\\end{tabular}\n");
     tex.push_str("\\end{table}\n");
