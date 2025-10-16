@@ -79,3 +79,15 @@
 \newcommand{\nin}{\cancel{\in}}
 \newcommand{\rowsp}[1]{\text{RowSp}\left(#1\right)}
 \newcommand{\aug}{&|&0}
+\newcommand{\bp}[1]{\Big(#1\Big)}
+\newcommand{\bx}[1]{\boxed{#1}}
+\newcommand{\contra}{\Rightarrow\Leftarrow}
+\newcommand{\qed}{\blacksquare}
+\newcommand{\f}{\qqqqq}
+\newcommand{\ff}{\f\f}
+\newcommand{\fff}{\ff\f}
+\newcommand{\ffff}{\ff\ff}
+\newcommand{\contra}{\Rightarrow\Leftarrow}
+\newcommand{\induct}[1]{(\forall n \in #1)\Big(P(n) \implies P(n+1)\Big)}
+\newcommand{\nni}{\cancel{\in}}
+\newcommand{\nrt}[2]{\sqrt[#1]{ #2 }}
