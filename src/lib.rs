@@ -11,8 +11,9 @@ use std::iter::{Peekable};
 use std::ops::{RangeBounds};
 use std::process::{Command, Stdio};
 use std::simd::{LaneCount, Mask, Simd, SupportedLaneCount};
-use std::simd::prelude::SimdPartialOrd;
+use std::simd::prelude::{SimdInt, SimdPartialOrd};
 use std::slice::SliceIndex;
+use std::string::FromUtf8Error;
 use std::time::Instant;
 use yaml_rust::{yaml, Yaml, YamlEmitter, YamlLoader};
 
@@ -56,8 +57,8 @@ static FINAL_FMT: Fmtr = r"\finalans{}";
 static PROMISE_FMT: Fmtr = "{}... ";
 static PROMISE_OK: &str = "OK";
 static OVERLEAF_URL: Fmtr = "https://www.overleaf.com/docs?snip_uri[]=data:application/x-tex;base64,{}";
-static BASE64_VECTOR_BITS: usize = 512; // <-- 2024 standard is AVX-512 (512b) or SVE2 (128-1024b in 128b incr); using Assigments 1-9 avg=4620c, stdev=2085c. Using 1024b/128B would be most optimal but seems like 512b/64B is safer.
-static BASE64_VECTOR_OFFS: [i8; 5] = [b'A' as i8, (b'a' - 26) as i8, (52 - b'0') as i8, (62 - b'+') as i8, (63 - b'/') as i8]; // <-- add these to 6-bit value to receive the base64 representation!
+static BASE64_VECTOR_SIZE: usize = 64; // <-- 2024 standard is AVX-512 (512b) or SVE2 (128-1024b in 128b incr); using Assigments 1-9 avg=4620c, stdev=2085c. Using 1024b/128B would be most optimal but seems like 512b/64B is safer.
+//static BASE64_VECTOR_OFFS: [i8; 5] = [b'A' as i8, (b'a' - 26) as i8, (52 - b'0') as i8, (62 - b'+') as i8, (63 - b'/') as i8]; // <-- add these to 6-bit value to receive the base64 representation!
 
 // raws         maps      ascii
 // 0..=25  ->   A-Z   -> +65
@@ -510,7 +511,7 @@ impl MarkdownDoc {
     pub fn compile(&self) -> TeXContent {
         let pr = Promise::only_wish(String::from("Compiling"));
 
-        let mut doc = open_db();
+        let doc = open_db();
 
         let decls = {
             let mut hot = parse_decls(&doc["decls"]);// <-- ...forgive my weird naming it's 00:14 lol
@@ -699,12 +700,12 @@ pub fn preprocess_content(mut content: Vec<String>) -> Vec<String> {
     content
 }
 
-pub fn send_to_overleaf(tex: TeXContent) -> Result<URL, ()> {
+pub fn send_to_overleaf(tex: TeXContent) -> Result<URL, FromUtf8Error> {
     // Encode into base64 (adapt from https://mcyoung.xyz/2023/11/27/simd-base64/#ascii-to-sextet)
-    let tex_b64 = str2base64::<BASE64_VECTOR_BITS>(&tex);
+    let tex_b64 = str2base64::<BASE64_VECTOR_SIZE>(&tex);
 
     // Parse into URL
-    tex_b64.and_then(|t| FmtStr::only_fmt(OVERLEAF_URL, &t))
+    tex_b64.and_then(|t| Ok(FmtStr::only_fmt(OVERLEAF_URL, &t).unwrap()))
 }
 
 // Note that statics are only declarable in .lhi and some add'l assumptions are made (strip spacing, immediately add all new, etc).
@@ -1110,28 +1111,28 @@ where LaneCount<U>: SupportedLaneCount {
     mask.select(Simd::splat(aug), Simd::splat(0))
 }
 
-/// Converts a string to Base64.
-pub fn str2base64<const N: usize>(str: &str) -> Result<String, ()>
+
+/// Converts a string to Base64, adding '=' padding if necessary for alignment.
+pub fn str2base64<const N: usize>(str: &str) -> Result<String, FromUtf8Error>
 where LaneCount<N>: SupportedLaneCount {
-    // CHALLENGE: avoid as many loops as possible and hyper-optimize!! (but not micro-optimize?)
+    // CHALLENGE: make this branchless and hyper-optimize!! (but not micro-optimize?)
     // └————— tl;dr hot-cold loops for unaligned read from string to prepare u6 -> u8 for SIMD magic.
     //      └————— ...this is moreso for practicing SIMD/raw pointers rather than applicability (e.g. using a zeroed u8 Vec prolly compiles to faster anyway).
-    
-    // Unaligned-read (`mov rax, qword ptr [rdx + rax]`!!!) through entire string
-    // @adapts https://lukefleed.xyz/posts/compressed-fixedvec/#faster-reads-unaligned-access
 
     // SAFETY: `str` is guaranteed to be valid UTF-8 (even if variable-length, base64 only takes 6b anyway) N x 8 bits.
-    let padded_str = unsafe {
-        let (mut ptr_u8, mut len, _): (*const u8, usize, _) = str.into_raw_parts();
+    unsafe {
+        // ❶ Pad the u6s to u8s! Unaligned-read (`mov rax, qword ptr [rdx + rax]`!!!) through entire string
+        // @adapts https://lukefleed.xyz/posts/compressed-fixedvec/#faster-reads-unaligned-access
+        let (mut ptr_u8, mut len, _): (*mut u8, usize, _) = str.to_string().into_raw_parts();
         len = (len * 8) / 6;
 
         let layout = Layout::from_size_align_unchecked(len, 8);
-        let mut ptr_ps = alloc_zeroed(layout);
+        let ptr_ps = alloc_zeroed(layout);
 
         let mut ptr_u6: *mut u8 = ptr_ps.clone();
 
         // `len` is num of u6 in str... then div by 4 for num of u24, remainder is removed 2 bits >:)
-        let mut memch: *mut u8 = 0u32 as *mut u8;
+        let memch: *mut u8 = 0u32 as *mut u8;
         for _ in 0..(len >> 2) {
             ptr::copy_nonoverlapping(ptr_u8, memch, 3);
 
@@ -1161,57 +1162,61 @@ where LaneCount<N>: SupportedLaneCount {
             b1 = b2;
         }
 
-        String::from_utf8_unchecked(Vec::from_raw_parts(ptr_u6, len, len))
-    };
+        // reset pointer position...
+        ptr_u6 = ptr_ps.clone();
 
-    // Unroll and jam loops! Hot loop is `chunks_exact` filling full SIMD registers, cold loop is part of a register.
-    // @adapts https://mcyoung.xyz/2023/11/27/simd-base64/#simd-hash-table (technique, `in_range`)
-    //
-    // raws           hex            maps      ascii
-    // 0..=25  ->   0x0..=0x19  ->   A-Z   -> +65
-    // 26..=51 ->   0x1A..=0x33 ->   a-z   -> +97
-    // 52..=61 ->   0x34..=0x3D ->   0-9   -> +48
-    // 62      ->   0x3E        ->    +    -> +43
-    // 63      ->   0x3F        ->    /    -> +47
-    //
-    // As far as I can tell there is no easy hashing function like w/ decoding (unique high nibbles)
-    // so the next-best is doing branchless mask magic.
-    //
-    // Use `simd_le` and `simd_ge` to make masks to extract ranges, then do
-    // masked splats augmenting offsets onto the mask values.
-    // Then just bitwise OR all of the augments together and add the entire
-    // offset vector to the chunk :D
-    //
-    // Note that this augment vector is dependent on the chunk values, so we can't
-    // pre-generate it before trying any data or anything, sadly.
+        // ❷ Unroll and jam loops for base64 conversion! Hot loop is `chunks_exact` filling full SIMD registers, cold loop is part of a register.
+        // @adapts https://mcyoung.xyz/2023/11/27/simd-base64/#simd-hash-table (technique, `in_range`)
+        //
+        // raws           hex            maps      ascii
+        // 0..=25  ->   0x0..=0x19  ->   A-Z   -> +65
+        // 26..=51 ->   0x1A..=0x33 ->   a-z   -> +97
+        // 52..=61 ->   0x34..=0x3D ->   0-9   -> +48
+        // 62      ->   0x3E        ->    +    -> +43
+        // 63      ->   0x3F        ->    /    -> +47
+        //
+        // As far as I can tell there is no easy hashing function like w/ decoding (unique high nibbles)
+        // so the next-best is doing branchless mask magic.
+        //
+        // Use `simd_le` and `simd_ge` to make masks to extract ranges, then do
+        // masked splats augmenting offsets onto the mask values.
+        // Then just bitwise OR all of the augments together and add the entire
+        // offset vector to the chunk :D
+        //
+        // Note that this augment vector is dependent on the chunk values, so we can't
+        // pre-generate it before trying any data or anything, sadly.
+        //
+        // ...technically may be more intuitive to map per-byte rather than writing then reading? bah lol
 
+        let mut chunk: [u8; N] = [0; N];
+        let ptr_chunk = chunk.as_mut_ptr();
+        //let (chunks_n, chunks_rem) = (len / N, len % N);
 
-    //
-    let mut chunks = padded_str.as_bytes().chunks_exact(N / u8::bits());
-    let mut base64 = String::with_capacity()
+        for _ in 0..=(len / N) { // <-- note that this will hit chunks_n as well as chunks_rem! this does mean chunks_rem will have some garbage, but string assembly trims that garbage off.
+            ptr::copy_nonoverlapping(ptr_u6, ptr_chunk, N);
 
-    for hotch in &mut chunks {
-        let shotch: Simd<u8, N> = hotch.try_into()?;
+            let chu: Simd<u8, N> = chunk.into(); // i need better names lol
 
-        let mask_upper = mask_range(&shotch, 0, 25);
-        let mask_lower = mask_range(&shotch, 26, 51);
-        let mask_numeric = mask_range(&shotch, 52,61);
-        let mask_pluses = mask_range(&shotch, 62,62);
-        let mask_slashes = mask_range(&shotch, 63,63);
+            let mask_upper = mask_range(&chu, 0, 25);
+            let mask_lower = mask_range(&chu, 26, 51);
+            let mask_numeric = mask_range(&chu, 52,61);
+            let mask_pluses = mask_range(&chu, 62,62);
+            let mask_slashes = mask_range(&chu, 63,63);
 
-        let result = masked_splat(&mask_upper, BASE64_VECTOR_OFFS[0]) |
-            masked_splat(&mask_lower, BASE64_VECTOR_OFFS[1]) |
-            masked_splat(&mask_numeric, BASE64_VECTOR_OFFS[2]) |
-            masked_splat(&mask_pluses, BASE64_VECTOR_OFFS[3]) |
-            masked_splat(&mask_slashes, BASE64_VECTOR_OFFS[4]);
+            let hun = masked_splat(&mask_upper, b'A' as i8) |
+                masked_splat(&mask_lower, (b'a' - 26) as i8) |
+                masked_splat(&mask_numeric, (52 - b'0') as i8) |
+                masked_splat(&mask_pluses, (62 - b'+') as i8) |
+                masked_splat(&mask_slashes, (63 - b'/') as i8);
 
+            let ptr_hun = hun.cast::<u8>()[..].as_ptr();
 
+            ptr::copy_nonoverlapping(ptr_hun, ptr_u6, N);
+            ptr_u6 = ptr_u6.add(N);
+        }
+
+        String::from_utf8(Vec::from_raw_parts(ptr_ps, len, len))
     }
-
-    let residual = chunks.remainder();
-
-
-    base64
 }
 
 // /// Splits u8 into two halves, inspired by [Vec::split_at_mut](std::vec::Vec::split_at_mut).
