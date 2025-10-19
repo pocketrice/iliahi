@@ -119,7 +119,7 @@ impl PreprocessorDirective {
             "MARK_FINAL" => Ok(PreprocessorDirective::MarkFinal),
             "ENFORCE_SPACING" => Ok(PreprocessorDirective::EnforceSpacing),
             "FLAT_SEGS" => Ok(PreprocessorDirective::FlatSegs),
-            d if let (Some(ident), Some(value)) = regextract_n(&re_def, d, &["ident", "value"]).iter().take(2).collect() => Ok(PreprocessorDirective::Define(*ident, *value)),
+            d if let [Some(ident), Some(value)] = regextract_n(&re_def, d, ["ident", "value"]) => Ok(PreprocessorDirective::Define(ident, value)), // SAFETY: compiler is blind but `regextract_n` is guaranteed to return vec of Option(n) for n capture groups.
             d if let Some(ident) = regextract(&re_incl, d, "ident") => Ok(PreprocessorDirective::Include(ident)), // <-- you could technically throw a fit here for nonexistant lib, but better to save until parse-time anyway. Plus, the mere existence of a directive does not constitute validity.
             _ => Err(()),
         }
@@ -640,8 +640,8 @@ fn capitalize(word: &str) -> String {
     new
 }
 
-/// Parses and collects given `.lhi` YAML of statics into string bundle. 
-/// 
+/// Parses and collects given `.lhi` YAML of statics into string bundle.
+///
 /// # Caveats
 /// Panicks if YAML is not 1D array of strings.
 fn parse_statics(yamls: &Yaml) -> String {
@@ -653,7 +653,7 @@ fn parse_statics(yamls: &Yaml) -> String {
 }
 
 /// Parses and collects given `.lhi` YAML of decls into string bundle.
-/// 
+///
 /// # Caveats
 /// Panicks if YAML is not 1D array of strings.
 /// Usage of decls must be within a TeX environment that supports `\newcommand`.
@@ -701,13 +701,13 @@ fn parse_decls(yamls: &Yaml) -> String {
 ///
 /// Note that this purposefully is not optimized as performance not critical for compilation; you can write
 /// the output to a separate designated "object" file if you want (e.g. .lho)
-/// 
+///
 /// # Caveats
 /// Applying all preprocessing will:
-/// 
+///
 /// - Guarantee all newlines are at most 1 line
 /// - Process all valid directives (%%...%%)
-/// 
+///
 /// Behavior may be modified as necessary.
 pub fn preprocess_content(mut content: Vec<String>) -> Vec<String> {
     // === Trim newlines (>=2 -> 1 \n) ===
@@ -766,7 +766,7 @@ pub fn preprocess_content(mut content: Vec<String>) -> Vec<String> {
 }
 
 /// Generates new Overleaf document from given TeX content via URL base64 payload encoding.
-/// 
+///
 /// # Caveats
 /// Errs if content could not be converted to base64.
 pub fn send_to_overleaf(tex: TeXContent) -> Result<URL, FromUtf8Error> {
@@ -782,7 +782,7 @@ pub fn send_to_overleaf(tex: TeXContent) -> Result<URL, FromUtf8Error> {
 
 /// Scans the given `.lhi` file capturing all statics and decls.
 /// The YAML database is appended with new candidates and resultant stats are printed to out.
-/// 
+///
 /// # Caveats
 /// The database must retain a valid format (e.g. array of 'decls' and 'statics' with identical destructured arrays as entries.
 pub fn scan_lhi(lhi: &File) {
@@ -846,7 +846,7 @@ pub fn scan_lhi(lhi: &File) {
 }
 
 /// Converts the collated decl into a YAML entry using [assemble_decl].
-/// 
+///
 /// # Caveats
 /// Errs if decl is not able to be parsed (i.e. invalid format).
 fn decl2yaml(decl: &str) -> Result<Yaml, String> {
@@ -880,7 +880,7 @@ fn query(msg: &str) -> String {
 }
 
 /// Consumes an entire AMD segment; this works with any level of segment.
-/// 
+///
 /// # Caveats
 /// Cannot guarantee that immediate next token contains matching EID so must manually pass the constructed segment's EID.
 /// Likewise, cannot know what to use to end stepping so must manually pass in delimiting pattern.
@@ -920,8 +920,8 @@ fn consume_segment<I: Iterator<Item = String>>(content: &mut Peekable<I>, delim:
     Segment { eid, content: Right(body) }
 }
 
-/// Consume EID from the immediate following token. 
-/// 
+/// Consume EID from the immediate following token.
+///
 /// # Caveats
 /// May require other operations in future hence separation from its (one) usage.
 fn consume_eid<I: Iterator<Item = String>>(content: &mut I, re: &Regex) -> Option<String> {
@@ -929,7 +929,7 @@ fn consume_eid<I: Iterator<Item = String>>(content: &mut I, re: &Regex) -> Optio
 }
 
 /// Assembles decl YAML given named regex captures.
-/// 
+///
 /// # Caveats
 /// Named capture groups must be `id`, `macro`, `pc` and datatypes must be valid.
 fn assemble_decl(caps: &Captures) -> Yaml { // <-- I don't think this is designed well so maybe fix!! ouo
@@ -948,19 +948,17 @@ fn regextract(re: &Regex, haystack: &str, name: &str) -> Option<String> {
 }
 
 /// Extracts the specified named capture groups from the given haystack, if present per-case.
-fn regextract_n(re: &Regex, haystack: &str, names: &[&str]) -> Vec<Option<String>> {
+fn regextract_n<const N: usize>(re: &Regex, haystack: &str, names: [&str; N]) -> [Option<String>; N]
+where [Option<String>; N]: Default {
     if let Some(caps) = re.captures(haystack).unwrap() {
-        Vec::from(names)
-            .iter()
-            .map(|&n| caps.name(n).and_then(|c| Some(c.as_str().to_string())))
-            .collect()
+        names.map(|n| caps.name(n).and_then(|c| Some(c.as_str().to_string())))
     } else {
-        vec![None; names.len()]
+        Default::default() // https://www.reddit.com/r/learnrust/comments/n0siwl/why_is_copy_required_for_initializing_an_array/; for Option<U>, U has trait reqs that None won't meet. Default does the trick!
     }
 }
 
 /// Merges two regex patterns together; the resultant may match either case.
-/// 
+///
 /// # Caveats
 /// This only works with regex with one (1) named capture group. Also naive implem as groups could already be named numerically (e.g. pat1 -> pat11).
 /// This may be inefficient as well, since it naively glues both together rather than considering redundancies (e.g. \[a-z] + \[f-zA-C] produces (\[a-z]|\[f-zA-C]), not \[a-zA-C]).
@@ -990,7 +988,7 @@ fn regmerge(re1: &Regex, re2: &Regex) -> Regex {
 //fn load_db<'d>() -> (&'d mut Array, &'d mut Array, BufWriter<File>) {
 
 /// Opens and parses the YAML decls/statics database.
-/// 
+///
 /// # Caveats
 /// Panicks if database not in valid format (see [scan_lhi] for validity specs).
 fn open_db() -> Yaml {
@@ -1002,7 +1000,7 @@ fn open_db() -> Yaml {
 }
 
 /// Opens YAML decls/statics database, and dumps/appends the given YAML doc.
-/// 
+///
 /// # Caveats
 /// Panicks if the given YAML is not valid or dumpable.
 fn write_db(doc: &Yaml) {
@@ -1024,7 +1022,7 @@ fn to_yaml_str(str: &str) -> Yaml {
 }
 
 /// Send contents to clipboard.
-/// 
+///
 /// # Caveats
 /// `pbcopy` must be present and executable (-xr) on the executing machine.
 pub fn to_clipboard(contents: &str) {
@@ -1037,7 +1035,7 @@ pub fn to_clipboard(contents: &str) {
 }
 
 /// Counts the number of occurrences of the given string within the haystack.
-/// 
+///
 /// # Caveats
 /// This uses blind exact-match counting, patterns and variations (e.g. caps) will not work.
 pub fn str_count(haystack: &str, needle: &str) -> usize {
@@ -1245,12 +1243,17 @@ where LaneCount<N>: SupportedLaneCount {
         let mut ptr_u6: *mut u8 = ptr_ps.clone();
 
         // `len` is num of u6 in str... then div by 4 for num of u24, remainder is removed 2 bits >:)
-        let memch: *mut u8 = 0u32 as *mut u8;
+        let mut chunk: [u8; 4] = [0; 4];
+        let mut ptr_chunk = chunk.as_mut_ptr();
+
+        // let mut memch = 0u32;
+        // let ptr_mch: *mut u8 = &mut memch;
+
         for _ in 0..(len >> 2) {
-            ptr::copy_nonoverlapping(ptr_u8, memch, 3);
+            ptr::copy_nonoverlapping(ptr_u8, ptr_chunk, 3);
 
             for mi in (0..16).step_by(4) { // <-- mi = mask index
-                ptr_u6.write(*memch & (0b0011_1111 << mi));
+                ptr_u6.write(*ptr_chunk & (0b0011_1111 << mi));
                 ptr_u6 = ptr_u6.add(1);
             }
         }
