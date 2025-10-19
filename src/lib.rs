@@ -69,15 +69,6 @@ static BASE64_VECTOR_SIZE: usize = 64; // <-- 2024 standard is AVX-512 (512b) or
 
 // static EID_LAYERS: (char, char, char) = ('1', 'a', 'i') <-- TODO i increments by roman numeral instead...
 
-/// Representation and destructuring of Assignment Markdown (AMD)
-/// in preparation for compilation to pure TeX.
-pub struct MarkdownDoc {
-    title: String,
-    decls: Vec<String>,
-    segs: Vec<Segment>, // assume (1)...($LEN), bound by bold TODO [Segment] should be more performant as on stack (esp. for arr of arr)
-    cache: Option<u8> // TODO make this (Sized) byte array
-}
-
 // macro_rules! tex_decl { <-- relic of using technique of actually replacing placeholders in content... no need!
 //
 // }
@@ -150,18 +141,11 @@ impl PreprocessorDirective {
             match dir {
                 PreprocessorDirective::Include(ident) => { // <-- #include are injected blindly to the top of the file for the sake of speed.
                     let lhi = File::open(&ident).expect(&format!("The include file, {}, does not exist or could not be opened", &ident));
-                    let mut num_decl = 0usize;
-                    let decls = fs::read_to_string(&ident)
-                        .expect(&format!("The include file, {}, could not be read", &ident))
-                        .split("\n")
-                        .for_each(|d| {
-                            content.push(String::from(d));
-                            num_decl += 1;
-                        });
+                    let decls = fs::read_to_string(&ident).expect(&format!("The include file, {}, could not be read", &ident));
+                    let decls_len = decls.len();
 
-                    content.rotate_right(num_decl); // <-- pushing to tail of vec then single memory realloc feels more performant than individually shifting all contents one-by-one...
-
-
+                    content.push(decls);
+                    content.rotate_right(decls_len); // <-- pushing to tail of vec then single memory realloc feels more performant than individually shifting all contents one-by-one...
                 },
                 PreprocessorDirective::MarkFinal => {
                     let (re_qq, re_final, re_seg) = (Regex::new(REGEX_USES_QQ).unwrap(), Regex::new(REGEX_USES_FINAL).unwrap(), Regex::new(REGEX_SEG_ANY).unwrap());
@@ -191,13 +175,16 @@ impl PreprocessorDirective {
                     // take that bchk!!! >:)
 
                     for i in 1..(content.len()-2) {
-                        let [mut pre, mut curr, peek, ..]= &content[(i-1)..(i+1)];
+                        // SAFETY: entering for loop = guaranteed chunk size of 3, indices never overlap.
+                        // `peek` is borrowed as mut even though it doesn't need to since (a) convinces bchk and (b) prolly saves time as it's 1 access vs. 2.
+                        let [pre, curr, peek] = unsafe { content.get_disjoint_unchecked_mut([i-1, i, i+1]) };
                         if re_seg.is_match(peek).unwrap() { // <-- final injection should occur on curr or pre... depending on if \n is present before segment identifier
                             let mut target = if curr.is_empty() { pre } else { curr };
                             if re_final.is_match(&target).unwrap() { break };
 
                             let nq = regextract(&re_qq, &target, "nq").unwrap();
-                            segpend(&mut target, (target.len() - nq.len()).., &fmst);
+                            let seg = (target.len() - nq.len())..;
+                            segpend(&mut target, seg, &fmst);
                         }
                     }
                 },
@@ -211,8 +198,8 @@ impl PreprocessorDirective {
 
         let re_seg_d2 = Regex::new(REGEX_SEG_D2).unwrap();
         for line in content {
-            for dir in dirs_local {
-                match dir {
+            for dir in &dirs_local {
+                match *dir {
                     PreprocessorDirective::TrimComms => {
                         let re_comms = Regex::new(REGEX_COMMS).unwrap();
                         re_comms.replace_all(line, "");
@@ -246,8 +233,8 @@ impl PreprocessorDirective {
             PreprocessorDirective::EnforceSpacing => String::from("&ENFORCE_SPACING"),
             PreprocessorDirective::FlatSegs => String::from("&FLATTEN"),
             PreprocessorDirective::IgnoreDecls => String::from("&IGNORE_DECL"),
-            PreprocessorDirective::Define(ident, value) => format!("&DEFINE({}, {})", ident, value).to_string(),
-            PreprocessorDirective::Include(ident) => format!("&INCLUDE({})", ident).to_string(),
+            PreprocessorDirective::Define(ident, value) => format!("&DEFINE({}, {})", ident, value),
+            PreprocessorDirective::Include(ident) => format!("&INCLUDE({})", ident),
         }
     }
 }
@@ -285,17 +272,22 @@ impl Promise {
 }
 
 impl Drop for Promise {
+    /// Drops and prints 'parting words' for this `Promise`.
     fn drop(&mut self) {
         println!("{} ({:.2}ms)", PROMISE_OK, self.ts.and_then(|t| Some(t.elapsed().as_micros() as f32 / 1000.0)).unwrap_or(0.0));
     }
 }
 
-pub struct Label { // <-- e.g. (1), ii., <hr>5</hr>
+/// Constrained representation of a 1-sub decorated label.
+/// Effectively a wrapped version of `FmtStr`.
+/// e.g. (1), ii., \<hr>5\</hr>
+pub struct Label {
     ident: String,   // raw value; 1
     ornament: FmtStr // outside wrapper; ({})
 }
 
 impl Label {
+    /// Creates new `Label` from parts, erring if a valid 1-sub `FmtStr` cannot be created.
     fn new(ident: String, ornament: String) -> Result<Label, ()> {
         match FmtStr::from(&ornament) {
             Ok(fmts) => Ok(Label { ident, ornament: fmts }),
@@ -303,6 +295,14 @@ impl Label {
         }
     }
 
+    /// Creates new `Label` from collated, erring if a valid 1-sub `FmtStr` cannot be created.
+    ///
+    /// # Caveats
+    /// Note that the label string must distinguish ident and ornament by wrapping ident with {}.
+    ///
+    /// e.g.: "({a})" or "{3}."
+    ///
+    /// format: \[ornament half] { \[ident] } \[ornament half]
     fn from(str: String) -> Result<Label, ()> {
         // note: the label string must distinguish ident and ornament by wrapping ident with {}.
         // e.g.: "({a})" or "{3}."
@@ -319,17 +319,23 @@ impl Label {
 
     }
 
+    /// Compiles the label parts into collated form.
     fn compile(&self) -> String {
         self.ornament.fmt(&self.ident)
     }
 }
 
+/// Representation of the segment structure (labeled ordered possibly-recursive groups of strings).
 pub struct Segment {
     eid: Label,
     content: Either<Vec<Segment>, String>, // assume (a)...(z) then 1. to $LEN., bound by italic
 }
 
 impl Segment {
+    /// Compiles the segment parts into collated form, with proper TeX spacing.
+    ///
+    /// # Caveats
+    /// TeX spacing depends on inclusion of `req.lhi` (or related spacers) in the compiled document.
     fn compile(&self) -> String {
         let eid = &self.eid.compile();
 
@@ -347,16 +353,27 @@ impl Segment {
     }
 }
 
+/// Constrained representation of a 1-sub format string for use with a string anchor.
 pub struct FmtStr { // <-- called FmtString? FmtStr? temporarily only accepts one anchor b/c format!() exists.
     orna_l: String,
     orna_h: String
 }
 
 impl FmtStr {
+    /// Creates a new `FmtStr` from parts.
+    ///
+    /// # Caveats
+    /// Note that this does not include the anchor.
     pub fn new(left: &str, right: &str) -> FmtStr {
         FmtStr { orna_l: left.to_string(), orna_h: right.to_string() }
     }
 
+    /// Creates a new `FmtStr` from collated form.
+    /// Errs if invalid form.
+    ///
+    /// # Caveats
+    /// Note that this does not include the anchor; also assumed use of
+    /// `FMT_ANCHOR` to represent the anchor.
     pub fn from(fmt_str: &str) -> Result<FmtStr, ()> {
         if fmt_str.contains(FMT_ANCHOR) {
             let (orna_l, orna_h) = fmt_str.split_once(FMT_ANCHOR).unwrap();
@@ -366,11 +383,18 @@ impl FmtStr {
         }
     }
 
+    /// Creates a new `FmtStr` from collated form with anchor and immediately formats.
+    /// Errs if invalid form.
+    ///
+    /// # Caveats
+    /// Note that this does not include the anchor; also assumed use of
+    /// `FMT_ANCHOR` to represent the anchor.
     pub fn only_fmt(fmt_str: &str, anchor: &dyn ToString) -> Result<String, ()> { // <-- **NEW** this is a new paradigm I'm designing to signify concise (but expensive) make-and-toss operations... OR shortcutting a single-time operation (like a fuse).
         let fmstr = FmtStr::from(fmt_str);
         fmstr.and_then(|fs| Ok(fs.fmt(anchor)))
     }
 
+    /// Formats and collates using the given anchor.
     pub fn fmt(&self, anchor: &dyn ToString) -> String {
         let mut res = String::from(&self.orna_l);
         res.push_str(&anchor.to_string());
@@ -379,10 +403,13 @@ impl FmtStr {
         res
     }
 
+    /// Returns length of ornaments, sans anchor (or placeholder).
     pub fn len(&self) -> usize {
         self.orna_l.len() + self.orna_h.len()
     }
 
+    /// Formats and collates using the anchor placeholder as anchor.
+    /// Useful if chaining with other formatters, like `format!()`.
     pub fn raw(&self) -> String {
         let mut res = String::from(&self.orna_l);
         res.push_str(FMT_ANCHOR);
@@ -392,7 +419,21 @@ impl FmtStr {
     }
 }
 
+
+/// Representation and destructuring of Assignment Markdown (AMD)
+/// in preparation for compilation to pure TeX.
+pub struct MarkdownDoc {
+    title: String,
+    decls: Vec<String>,
+    segs: Vec<Segment>, // assume (1)...($LEN), bound by bold TODO [Segment] should be more performant as on stack (esp. for arr of arr)
+    //cache: Option<u8> // TODO make this (Sized) byte array
+}
+
 impl MarkdownDoc {
+    /// Creates new AMD document representation by parsing from the given filepath, preprocessing, checking decls into database, and destructuring segments.
+    ///
+    /// # Caveats
+    /// Panicks if path was invalid or file could not be read. This behavior may change in the future (i.e. return Result<Self, ()>).
     pub fn new(path: &str) -> Self {
         let (file, title) = (File::open(path).expect("Could not read file"), path.split('.').next().expect("File format bad").to_string());
         let content = BufReader::new(file).lines()
@@ -463,8 +504,8 @@ impl MarkdownDoc {
                 }
             }
 
-            write_db(&doc); // <-- write hot decls to db
-            hot_decls.clear();                                                            // <-- clear hot decls as already written to database
+            write_db(&doc);    // <-- write hot decls to db
+            hot_decls.clear(); // <-- clear hot decls as already written to database
         }
 
         pr_decls.fulfill();
@@ -502,12 +543,14 @@ impl MarkdownDoc {
 
         pr_segs.fulfill();
 
-        // TODO image cache
-        let cache = None;
+        // // TODO image cache
+        // let cache = None;
 
 
-        Self { title, decls: hot_decls, segs, cache }
+        Self { title, decls: hot_decls, segs/*, cache*/ }
     }
+
+    /// Compiles a prepared AMD document into TeX, via injecting decls and substituting content into TeX template.
     pub fn compile(&self) -> TeXContent {
         let pr = Promise::only_wish(String::from("Compiling"));
 
@@ -549,8 +592,11 @@ impl MarkdownDoc {
     }
 }
 
+
+/// Returns string containing ordinal number with corresponding suffix.
 fn ordinize(ordinal: u8) -> String {
     let fmtr = match ordinal {
+        0 => "th",
         i if i % 10 == 1 => "st",
         i if i % 10 == 2 => "nd",
         i if i % 10 == 3 => "rd",
@@ -560,6 +606,7 @@ fn ordinize(ordinal: u8) -> String {
     format!("{}{}", ordinal, fmtr)
 }
 
+/// Converts (solar 12mo calendar) month from numeric to word form.
 fn monthize(month: u8) -> String {
     match month {
         1 => "January".to_string(),
@@ -578,6 +625,7 @@ fn monthize(month: u8) -> String {
     }
 }
 
+/// Capitalizes the given string; if empty no change.
 fn capitalize(word: &str) -> String {
     let mut new = String::from(word);
 
@@ -592,6 +640,10 @@ fn capitalize(word: &str) -> String {
     new
 }
 
+/// Parses and collects given `.lhi` YAML of statics into string bundle. 
+/// 
+/// # Caveats
+/// Panicks if YAML is not 1D array of strings.
 fn parse_statics(yamls: &Yaml) -> String {
     let statics = yamls.as_vec().expect("Bad statics YAML format");
     statics.iter()
@@ -600,6 +652,11 @@ fn parse_statics(yamls: &Yaml) -> String {
         .join("\n")
 }
 
+/// Parses and collects given `.lhi` YAML of decls into string bundle.
+/// 
+/// # Caveats
+/// Panicks if YAML is not 1D array of strings.
+/// Usage of decls must be within a TeX environment that supports `\newcommand`.
 fn parse_decls(yamls: &Yaml) -> String {
     // - entry:
     //     id: ".."
@@ -644,6 +701,14 @@ fn parse_decls(yamls: &Yaml) -> String {
 ///
 /// Note that this purposefully is not optimized as performance not critical for compilation; you can write
 /// the output to a separate designated "object" file if you want (e.g. .lho)
+/// 
+/// # Caveats
+/// Applying all preprocessing will:
+/// 
+/// - Guarantee all newlines are at most 1 line
+/// - Process all valid directives (%%...%%)
+/// 
+/// Behavior may be modified as necessary.
 pub fn preprocess_content(mut content: Vec<String>) -> Vec<String> {
     // === Trim newlines (>=2 -> 1 \n) ===
     //
@@ -700,6 +765,10 @@ pub fn preprocess_content(mut content: Vec<String>) -> Vec<String> {
     content
 }
 
+/// Generates new Overleaf document from given TeX content via URL base64 payload encoding.
+/// 
+/// # Caveats
+/// Errs if content could not be converted to base64.
 pub fn send_to_overleaf(tex: TeXContent) -> Result<URL, FromUtf8Error> {
     // Encode into base64 (adapt from https://mcyoung.xyz/2023/11/27/simd-base64/#ascii-to-sextet)
     let tex_b64 = str2base64::<BASE64_VECTOR_SIZE>(&tex);
@@ -710,6 +779,12 @@ pub fn send_to_overleaf(tex: TeXContent) -> Result<URL, FromUtf8Error> {
 
 // Note that statics are only declarable in .lhi and some add'l assumptions are made (strip spacing, immediately add all new, etc).
 // ...hence why this is not broadened to work for local scan.
+
+/// Scans the given `.lhi` file capturing all statics and decls.
+/// The YAML database is appended with new candidates and resultant stats are printed to out.
+/// 
+/// # Caveats
+/// The database must retain a valid format (e.g. array of 'decls' and 'statics' with identical destructured arrays as entries.
 pub fn scan_lhi(lhi: &File) {
     let mut buf = BufReader::new(lhi)
         .lines()
@@ -770,6 +845,10 @@ pub fn scan_lhi(lhi: &File) {
     println!("⊛ {} (+ {} replaced) decls, {} statics", num_decl_new, num_decl_rep, num_static);
 }
 
+/// Converts the collated decl into a YAML entry using [assemble_decl].
+/// 
+/// # Caveats
+/// Errs if decl is not able to be parsed (i.e. invalid format).
 fn decl2yaml(decl: &str) -> Result<Yaml, String> {
     // decl format is "\newcommand{\$ID}{$MACRO}" or "\newcommand{\$ID}[$PC]{$MACRO}}"
     let (re_valid, re_invalid) = (Regex::new(REGEX_DECL_VALID).unwrap(), Regex::new(REGEX_DECL_INVALID).unwrap());
@@ -790,6 +869,7 @@ fn decl2yaml(decl: &str) -> Result<Yaml, String> {
     }
 }
 
+/// Prompts user for input and returns, erring if unable to read from buffer.
 fn query(msg: &str) -> String {
     print!("{}", format!("{} ... ", msg));
     let _ = stdout().flush();
@@ -799,7 +879,11 @@ fn query(msg: &str) -> String {
     bfr.trim().to_string()
 }
 
-/// Consumes a segment; cannot guarantee that immediate next token contains EID so must manually pass EID.
+/// Consumes an entire AMD segment; this works with any level of segment.
+/// 
+/// # Caveats
+/// Cannot guarantee that immediate next token contains matching EID so must manually pass the constructed segment's EID.
+/// Likewise, cannot know what to use to end stepping so must manually pass in delimiting pattern.
 fn consume_segment<I: Iterator<Item = String>>(content: &mut Peekable<I>, delim: &Regex, eid: Label) -> Segment {
     let mut body = String::new();
     let re_qq = Regex::new(REGEX_USES_QQ).unwrap();
@@ -836,11 +920,18 @@ fn consume_segment<I: Iterator<Item = String>>(content: &mut Peekable<I>, delim:
     Segment { eid, content: Right(body) }
 }
 
-// Consume EID from the immediate following token. May require other operations in future hence separation.
+/// Consume EID from the immediate following token. 
+/// 
+/// # Caveats
+/// May require other operations in future hence separation from its (one) usage.
 fn consume_eid<I: Iterator<Item = String>>(content: &mut I, re: &Regex) -> Option<String> {
     regextract(re, &content.next().unwrap(), "eid")
 }
 
+/// Assembles decl YAML given named regex captures.
+/// 
+/// # Caveats
+/// Named capture groups must be `id`, `macro`, `pc` and datatypes must be valid.
 fn assemble_decl(caps: &Captures) -> Yaml { // <-- I don't think this is designed well so maybe fix!! ouo
     let (id, mac, pc) = (&caps["id"], &caps["macro"], &caps.name("pc"));
     let mut hash = yaml::Hash::new();
@@ -850,11 +941,13 @@ fn assemble_decl(caps: &Captures) -> Yaml { // <-- I don't think this is designe
     Yaml::Hash(hash)
 }
 
+/// Extracts named capture group from matching the given haystack, if present.
 fn regextract(re: &Regex, haystack: &str, name: &str) -> Option<String> {
     let caps = re.captures(haystack).unwrap();
     caps.and_then(|c| Some(c[name].to_string()))
 }
 
+/// Extracts the specified named capture groups from the given haystack, if present per-case.
 fn regextract_n(re: &Regex, haystack: &str, names: &[&str]) -> Vec<Option<String>> {
     if let Some(caps) = re.captures(haystack).unwrap() {
         Vec::from(names)
@@ -866,7 +959,11 @@ fn regextract_n(re: &Regex, haystack: &str, names: &[&str]) -> Vec<Option<String
     }
 }
 
+/// Merges two regex patterns together; the resultant may match either case.
+/// 
+/// # Caveats
 /// This only works with regex with one (1) named capture group. Also naive implem as groups could already be named numerically (e.g. pat1 -> pat11).
+/// This may be inefficient as well, since it naively glues both together rather than considering redundancies (e.g. \[a-z] + \[f-zA-C] produces (\[a-z]|\[f-zA-C]), not \[a-zA-C]).
 fn regmerge(re1: &Regex, re2: &Regex) -> Regex {
     let meta_re = Regex::new(REGEX_META_NCAP).unwrap();
     let (mut str1, mut str2) = (re1.to_string(), re2.to_string());
@@ -892,6 +989,10 @@ fn regmerge(re1: &Regex, re2: &Regex) -> Regex {
 
 //fn load_db<'d>() -> (&'d mut Array, &'d mut Array, BufWriter<File>) {
 
+/// Opens and parses the YAML decls/statics database.
+/// 
+/// # Caveats
+/// Panicks if database not in valid format (see [scan_lhi] for validity specs).
 fn open_db() -> Yaml {
     let doc = {
         let raw = fs::read_to_string(PATH_DB).expect("Could not read decls YAML");
@@ -900,6 +1001,10 @@ fn open_db() -> Yaml {
     doc.into_iter().next().unwrap_or(Yaml::Array(vec![]))
 }
 
+/// Opens YAML decls/statics database, and dumps/appends the given YAML doc.
+/// 
+/// # Caveats
+/// Panicks if the given YAML is not valid or dumpable.
 fn write_db(doc: &Yaml) {
     let mut db = OpenOptions::new()
         .write(true)
@@ -913,11 +1018,15 @@ fn write_db(doc: &Yaml) {
     db.write_all(dump.as_bytes()).expect("Could not write to decl DB");
 }
 
+/// Helper function for converting Rust string to YAML string.
 fn to_yaml_str(str: &str) -> Yaml {
     Yaml::String(str.to_string())
 }
 
 /// Send contents to clipboard.
+/// 
+/// # Caveats
+/// `pbcopy` must be present and executable (-xr) on the executing machine.
 pub fn to_clipboard(contents: &str) {
     let mut pbcopy = Command::new("pbcopy")
         .stdin(Stdio::piped())
@@ -927,6 +1036,10 @@ pub fn to_clipboard(contents: &str) {
     pbcopy.wait().unwrap();
 }
 
+/// Counts the number of occurrences of the given string within the haystack.
+/// 
+/// # Caveats
+/// This uses blind exact-match counting, patterns and variations (e.g. caps) will not work.
 pub fn str_count(haystack: &str, needle: &str) -> usize {
     haystack.match_indices(needle).count()
 }
@@ -961,10 +1074,9 @@ pub fn uproot(haystack: &mut String, fmtstr: &str, needle: &str) {
 
 /// Takes a segment out of a string, pre-allocates size and appends modifications, puts back.
 pub fn segpend<R: RangeBounds<usize> + Clone + SliceIndex<str, Output=str>>(str: &mut String, seg: R, append: &FmtStr) {
-    // Extract and prepare carrier string
-    str.reserve_exact(append.len());
-    let pati = str.get(seg.clone()).unwrap();
-    str.replace_range(seg, &append.fmt(&pati));
+    str.reserve_exact(append.len());                 // <-- prealloc base string
+    let pati = str.get(seg.clone()).unwrap(); // <-- take segment
+    str.replace_range(seg, &append.fmt(&pati));     // <-- append mod to seg, put back
 }
 
 
@@ -1075,13 +1187,13 @@ pub fn segtil(str: &str, re: &Regex, chunk_by: usize) -> (String, usize) {
 /// # Caveats
 /// The adapter must be called on pre-mapped optionals, please use `symmetrize_iters` to prepare.
 /// This is to support idempotency.
-pub fn transpose_iters_asymm<I,J,T>(iters: I) -> I // <-- TODO impl generics getting out of hand!!
-where
-    I: IntoIterator<Item=J>,
-    J: IntoIterator<Item=Option<T>>,
-{
-    unimplemented!();
-}
+// pub fn transpose_iters_asymm<I,J,T>(iters: I) -> I // <-- TODO impl generics getting out of hand!!
+// where
+//     I: IntoIterator<Item=J>,
+//     J: IntoIterator<Item=Option<T>>,
+// {
+//     unimplemented!();
+// }
 
 // Symmetrizes "iter-of-iters" or 2D iter by filling
 // pub fn symmetrize_iters<I,J,K,T>(iters: I) -> impl IntoIterator<Item=K>
@@ -1113,6 +1225,7 @@ where LaneCount<U>: SupportedLaneCount {
 
 
 /// Converts a string to Base64, adding '=' padding if necessary for alignment.
+/// Errs if cannot assemble valid (UTF-8) string from modified bytes.
 pub fn str2base64<const N: usize>(str: &str) -> Result<String, FromUtf8Error>
 where LaneCount<N>: SupportedLaneCount {
     // CHALLENGE: make this branchless and hyper-optimize!! (but not micro-optimize?)
