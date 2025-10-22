@@ -22,7 +22,16 @@ type URL = String;
 type Fmtr<'a> = &'a str;
 
 
-static VERSION_NUM: &str = "0.1.0";
+// changelog
+// 0.0.1 ... supports basic features (no preproc/db)
+// 0.1.0 ... decls rewrite to use db
+// 0.1.1 ... (+) statics support to db, .lhi files
+// 0.1.2 ... preprocessor experimentation, migration to nightly
+// 0.2.0 ... (+) preprocessor support, hyperoptim base64/overleaf export
+
+// 0.2.1 ... (+) table parsing?
+
+static VERSION_NUM: &str = "0.2.0";
 static VERSION_BRANCH: &str = "stable";
 
 
@@ -37,8 +46,8 @@ static REGEX_DECL_ID: &str = r"\\newcommand\{\\(?P<id>[a-z]+)}(\[\d+])?\{.*}";
 static REGEX_USES_FINAL: &str = r".*(\\finalans\{.+\}).*";
 static REGEX_USES_QQ: &str = r"((\\(q+|[;,>:]|(hspace)))*)(?<nq>.+)";
 static REGEX_COMMS: &str = "%{2}.*?%{2}";
-static REGEX_PREPROC_DEFINE: &str = r"^DEFINE *\( *(?<ident>.+?) *, *(?<value>.*? *)\)$";
-static REGEX_PREPROC_INCLUDE: &str = r"^INCLUDE *\( *(?<ident>.+?)\.lhi *\)$";
+static REGEX_PREPROC_DEFINE: &str = r"^&DEFINE *\( *(?<ident>.+?) *, *(?<value>.*? *)\)$";
+static REGEX_PREPROC_INCLUDE: &str = r"^&INCLUDE *\( *(?<ident>.+?)\.lhi *\)$";
 
 // static REGEX_QQ: &str = r"(\\(q+|[;,>:]|(hspace)))";
 
@@ -53,9 +62,11 @@ static PATH_DB: &str = "db.yaml";
 static PATH_TEMPLATE: &str = "template.tex";
 static NO_MATCH: &str = "";
 static LINE_BREAK: &str = "<hr>";
-static FINAL_FMT: Fmtr = r"\finalans{}";
+static FINAL_FMT: Fmtr = r"\finalans{{}}";
 static PROMISE_FMT: Fmtr = "{}... ";
 static PROMISE_OK: &str = "OK";
+static PROMISE_NG: &str = "NG";
+static PROMISE_DEF_PRECISION: usize = 3;
 static OVERLEAF_URL: Fmtr = "https://www.overleaf.com/docs?snip_uri[]=data:application/x-tex;base64,{}";
 static BASE64_VECTOR_SIZE: usize = 64; // <-- 2024 standard is AVX-512 (512b) or SVE2 (128-1024b in 128b incr); using Assigments 1-9 avg=4620c, stdev=2085c. Using 1024b/128B would be most optimal but seems like 512b/64B is safer.
 //static BASE64_VECTOR_OFFS: [i8; 5] = [b'A' as i8, (b'a' - 26) as i8, (52 - b'0') as i8, (62 - b'+') as i8, (63 - b'/') as i8]; // <-- add these to 6-bit value to receive the base64 representation!
@@ -109,17 +120,17 @@ impl PreprocessorDirective {
     ///
     /// # Caveats
     /// Note that `directive` will be in the form of "(.*)"; note
-    /// the lack of both directive indicator and newline char.
+    /// stripped newline but presence of & identifier.
     pub fn from(directive: &str) -> Result<PreprocessorDirective, ()> {
         let (re_def, re_incl) = (Regex::new(REGEX_PREPROC_DEFINE).unwrap(), Regex::new(REGEX_PREPROC_INCLUDE).unwrap());
 
         match directive {
-            "TRIM_COMM" => Ok(PreprocessorDirective::TrimComms),
-            "IGNORE_DECLS" => Ok(PreprocessorDirective::IgnoreDecls),
-            "MARK_FINAL" => Ok(PreprocessorDirective::MarkFinal),
-            "ENFORCE_SPACING" => Ok(PreprocessorDirective::EnforceSpacing),
-            "FLAT_SEGS" => Ok(PreprocessorDirective::FlatSegs),
-            d if let [Some(ident), Some(value)] = regextract_n(&re_def, d, ["ident", "value"]) => Ok(PreprocessorDirective::Define(ident, value)), // SAFETY: compiler is blind but `regextract_n` is guaranteed to return vec of Option(n) for n capture groups.
+            "&TRIM_COMM" => Ok(PreprocessorDirective::TrimComms),
+            "&IGNORE_DECLS" => Ok(PreprocessorDirective::IgnoreDecls),
+            "&FINALIZE" => Ok(PreprocessorDirective::MarkFinal),
+            "&ENFORCE_SPACING" => Ok(PreprocessorDirective::EnforceSpacing),
+            "&FLATTEN" => Ok(PreprocessorDirective::FlatSegs),
+            d if let [Some(ident), Some(value)] = regextract_n(&re_def, d, ["ident", "value"]) => Ok(PreprocessorDirective::Define(ident, value)),
             d if let Some(ident) = regextract(&re_incl, d, "ident") => Ok(PreprocessorDirective::Include(ident)), // <-- you could technically throw a fit here for nonexistant lib, but better to save until parse-time anyway. Plus, the mere existence of a directive does not constitute validity.
             _ => Err(()),
         }
@@ -140,12 +151,13 @@ impl PreprocessorDirective {
         for dir in dirs_global {
             match dir {
                 PreprocessorDirective::Include(ident) => { // <-- #include are injected blindly to the top of the file for the sake of speed.
-                    let lhi = File::open(&ident).expect(&format!("The include file, {}, does not exist or could not be opened", &ident));
-                    let decls = fs::read_to_string(&ident).expect(&format!("The include file, {}, could not be read", &ident));
-                    let decls_len = decls.len();
-
-                    content.push(decls);
-                    content.rotate_right(decls_len); // <-- pushing to tail of vec then single memory realloc feels more performant than individually shifting all contents one-by-one...
+                    let decls = fs::read_to_string(format!("{}.lhi", ident)).expect(&format!("The include file, {}, could not be read", &ident));
+                    content.insert(0, decls);
+                    // ▼ use if `content` is purely a string and not vec of strings! ▼
+                    // let decls_len = decls.len();
+                    //
+                    // content.push(decls);
+                    // content.rotate_right(decls_len); // <-- pushing to tail of vec then single memory realloc feels more performant than individually shifting all contents one-by-one...
                 },
                 PreprocessorDirective::MarkFinal => {
                     let (re_qq, re_final, re_seg) = (Regex::new(REGEX_USES_QQ).unwrap(), Regex::new(REGEX_USES_FINAL).unwrap(), Regex::new(REGEX_SEG_ANY).unwrap());
@@ -202,7 +214,7 @@ impl PreprocessorDirective {
                 match *dir {
                     PreprocessorDirective::TrimComms => {
                         let re_comms = Regex::new(REGEX_COMMS).unwrap();
-                        re_comms.replace_all(line, "");
+                        *line = re_comms.replace_all(line, "").into_owned();
                     },
                     PreprocessorDirective::Define(ident, value) => {
                         *line = line.replace(ident, &value);
@@ -242,7 +254,7 @@ impl PreprocessorDirective {
 /// An operation segmentator based on wish/fulfill-design.
 pub struct Promise {
     ident: String,
-    ts: Option<Instant>
+    ts: Option<Instant> // timer, time precision
 }
 
 impl Promise {
@@ -265,18 +277,19 @@ impl Promise {
         print!("{}", self.ident);
     }
 
-    /// Fulfills the promise, thus closing it.
-    fn fulfill(self) { // <-- more behavior can go here if needed (don't touch Drop; may want to allow a cleanup function etc etc.)
-        drop(self);
+    /// Fulfills the promise and outputs based on pass condition, thus closing it.
+    fn fulfill(self, pass: bool) { // <-- more behavior can go here if needed (don't touch Drop; may want to allow a cleanup function etc etc.)
+        let msg = if pass { PROMISE_OK } else { PROMISE_NG };
+        println!("{} ({:.3}ms)", msg, self.ts.and_then(|t| Some(t.elapsed().as_micros() as f32 / 1000.0)).unwrap_or(0.0));
     }
 }
-
-impl Drop for Promise {
-    /// Drops and prints 'parting words' for this `Promise`.
-    fn drop(&mut self) {
-        println!("{} ({:.2}ms)", PROMISE_OK, self.ts.and_then(|t| Some(t.elapsed().as_micros() as f32 / 1000.0)).unwrap_or(0.0));
-    }
-}
+//
+// impl Drop for Promise {
+//     /// Drops and prints 'parting words' for this `Promise`.
+//     fn drop(&mut self) {
+//         println!("{} ({:.2}ms)", PROMISE_OK, self.ts.and_then(|t| Some(t.elapsed().as_micros() as f32 / 1000.0)).unwrap_or(0.0));
+//     }
+// }
 
 /// Constrained representation of a 1-sub decorated label.
 /// Effectively a wrapped version of `FmtStr`.
@@ -446,7 +459,7 @@ impl MarkdownDoc {
             .into_iter()
             .peekable();
 
-        pr_prep.fulfill();
+        pr_prep.fulfill(true);
 
         // Note on parsing decls... strips all $ — may be problematic for decl macros that use $$, but obsitex theoretically shouldn't permit it.
 
@@ -508,7 +521,7 @@ impl MarkdownDoc {
             hot_decls.clear(); // <-- clear hot decls as already written to database
         }
 
-        pr_decls.fulfill();
+        pr_decls.fulfill(true);
 
         // Parse segments. Depth of 2 for now.
         let pr_segs = Promise::only_wish(String::from("Parsing segments"));
@@ -541,7 +554,7 @@ impl MarkdownDoc {
             segs.push(seg);
         }
 
-        pr_segs.fulfill();
+        pr_segs.fulfill(true);
 
         // // TODO image cache
         // let cache = None;
@@ -586,7 +599,7 @@ impl MarkdownDoc {
         template = template.replace("%DATE", &time);
         template = template.replace("%CONTENT", &content);
 
-        pr.fulfill();
+        pr.fulfill(true);
 
         TeXContent::from(template)
     }
@@ -749,11 +762,14 @@ pub fn preprocess_content(mut content: Vec<String>) -> Vec<String> {
     //
     // ...note that `is_some_and(|[l1, l2, ..]| l1.contains("%%") || l2.contains("%%"))` feels plausible but the compiler
     //    cannot guarantee length of arrays (even if it's [N; 2]!) so refutable closure pattern.
-    if content.get(0..=1).is_some_and(|ls| ls[0].contains("%%") || ls[1].contains("%%")) {
-        let mut lines = content.iter();
+
+    if content.first().is_some_and(|l| l.is_empty()) { content.remove(0); } // this simple check saves many simple checks later... net profit vuv
+
+    if content.first().is_some_and(|l| l.contains("%%")) {
+        let mut lines = content.iter().skip(1);
         let mut directives = Vec::<PreprocessorDirective>::new();
 
-        while let Some(line) = lines.nth(0) && !line.contains("%%") {
+        while let Some(line) = lines.next() && !line.contains("%%") {
             if let Ok(dir) = PreprocessorDirective::from(line.trim()) {
                 directives.push(dir);
             }
@@ -1222,7 +1238,7 @@ where LaneCount<U>: SupportedLaneCount {
 }
 
 
-/// Converts a string to Base64, adding '=' padding if necessary for alignment.
+/// Converts a string to Base64, appending alignment character(s) when necessary.
 /// Errs if cannot assemble valid (UTF-8) string from modified bytes.
 pub fn str2base64<const N: usize>(str: &str) -> Result<String, FromUtf8Error>
 where LaneCount<N>: SupportedLaneCount {
@@ -1230,58 +1246,135 @@ where LaneCount<N>: SupportedLaneCount {
     // └————— tl;dr hot-cold loops for unaligned read from string to prepare u6 -> u8 for SIMD magic.
     //      └————— ...this is moreso for practicing SIMD/raw pointers rather than applicability (e.g. using a zeroed u8 Vec prolly compiles to faster anyway).
 
+
     // SAFETY: `str` is guaranteed to be valid UTF-8 (even if variable-length, base64 only takes 6b anyway) N x 8 bits.
     unsafe {
         // ❶ Pad the u6s to u8s! Unaligned-read (`mov rax, qword ptr [rdx + rax]`!!!) through entire string
+        // Note that (i) string has to be padded with zero bytes for perfect 3B chunks and (ii) bytes have to be put into big endian!
         // @adapts https://lukefleed.xyz/posts/compressed-fixedvec/#faster-reads-unaligned-access
-        let (mut ptr_u8, mut len, _): (*mut u8, usize, _) = str.to_string().into_raw_parts();
-        len = (len * 8) / 6;
+        let (mut padded_str, mut len) = (str.to_string(), str.len());
+        let pad = ((len % 3) ^ 2 ^ 1) % 3;
+
+        padded_str.push_str(&String::from_utf8(vec![0x0, pad as u8])?); // 2 -> 1, 1 -> 2; 5 -> 2, 6 -> 1
+        let mut ptr_u8: *mut u8 = padded_str.as_mut_ptr();
+
+        len = ((len + pad) * 8) / 6; // <-- even with the 3B guarantee, still have to divide!
+
+        // let (mut ptr_u8, mut len, _): (*mut u8, usize, _) = padded_str.into_raw_parts(); <-- per the docs, this memory is not freed unless `from_raw_parts` is called :(
+
+        // wait, first what the hey is going on in that vec! declaration?
+        // this is for padding zero bytes to make perfect 3B chunks, but note that `len % 3` is not enough as 2 maps to '=' (1) and 1 maps to '==' (2).
+        //
+        // if you look at small samples, you'll see that len 3 -> '', len 4 -> '==', len 5 -> '=', len 6 = '', len 7 -> '=', len 8 -> '=='...
+        // oh!! if not divisible by 3, then even takes '==' (2) and odd takes '=' (1).
+        //
+        // ~~courtesy of https://electronics.stackexchange.com/a/611862/451305, seems like modulo is usually expensive, unless you already know what you mod by!
+        // in that case the compiler, rather than using taxing division (ouch) will turn it into a simple mask (ie a & 0x07) which is nice and cheap!~~
+        // ▲ false; rust 1.90.0 optimizes powers-of-2 into `and rax, 3...` while nons into `xor edx, edx; div rcx...` vnv
+        //
+        // but turns out our good friend xor has something to say...
+        // a ^ a = 0
+        // a ^ 0 = a
+        //
+        // done and dusted!
+        // (len % 3) ^ (2 ^ 1)
+
+        //assert!(N <= len, "Cannot call with N > string length");
 
         let layout = Layout::from_size_align_unchecked(len, 8);
         let ptr_ps = alloc_zeroed(layout);
 
         let mut ptr_u6: *mut u8 = ptr_ps.clone();
 
+        // 'HOT LOOP'
         // `len` is num of u6 in str... then div by 4 for num of u24, remainder is removed 2 bits >:)
-        let mut chunk: [u8; 4] = [0; 4];
-        let mut ptr_chunk = chunk.as_mut_ptr();
+        // let mut chunk: [u8; 3] = [0; 3];
+        // let mut ptr_chunk = chunk.as_mut_ptr();
 
-        // let mut memch = 0u32;
-        // let ptr_mch: *mut u8 = &mut memch;
+        let mut chunk = 0u32;
+        let ptr_chunk: *mut u8 = (&raw mut chunk).cast::<u8>(); // <-- `addr_as_mut!` is soft-deprecated, recommended &raw mut instead.
 
         for _ in 0..(len >> 2) {
-            ptr::copy_nonoverlapping(ptr_u8, ptr_chunk, 3);
+            ptr::copy_nonoverlapping(ptr_u8, ptr_chunk,3); // <-- `chunk` is anchored LSB, `ptr_chunk` is anchored MSB! (1111_1100_0000_0000 vs 0000_0000_0011_1111)
+            chunk = chunk.to_be() >> 8; // <-- must convert to big-endian, but note that u32 is 4 bytes not 3, so shift back into position (as in, "41 42 43 00".to_be() = "00 43 42 41" not "43 42 41 00"!)
 
-            for mi in (0..16).step_by(4) { // <-- mi = mask index
-                ptr_u6.write(*ptr_chunk & (0b0011_1111 << mi));
+            // a little something to help you visualize...!
+            // let's try with `base64_sm_remless`'s example, "000" or 0x303030.
+            //
+            //                (1)       (2)        (3)     (4)
+            // 0bXXXX_XXXX_[0011_00][00_0011]_[0000_00][11_0000]
+            //
+            // (1) 0011_00 = 12 = 0x0C
+            // (2) 00_0011 = 3 = 0x03
+            // (3) 0000_00 = 0 = 0x00
+            // (4) 11_0000 = 48 = 0x30
+            //
+            // that example doesn't demonstrate but note byte endianness matters...
+            // consider a truncation of `base64_med_remless`, "ABC" or 0x414243.
+            // this is equivalent to 0b01000001_01000010_0100011.
+            //
+            // naively extracting the most-significant bits using the following code
+            // will actually give you malformed output!
+            //
+            //
+            // the naive trick works for "000" since byte order is irrelevant, but it does here.
+            //      you get 0b[010000][11_0100][0010_01][000001] which produces Q8JB...
+            // but you want 0b[010000][01_0100][0010_01][000011] which produces QUJD!
+            // so obviously you need to change it from little endian to big endian, right?
+            //
+            // things get complicated when you consider a multi-chunk like "ABCDEF"... you can't just simply
+            // take the string and flip all the bytes b/c that messes up ordering.
+            //
+            // ✧ the key is to convert to big-endian... u32 is 4 not 3 bytes hence see the fix above nvn ✧
+
+            for _ in 0..4 {
+                ptr_u6.write(((chunk & 0xFC0000) >> 18) as u8); // 0xFC0000 = 0b0000_0000_1111_1100_0000_0000_0000_0000 (leading 6 bits)
+                chunk <<= 6;
                 ptr_u6 = ptr_u6.add(1);
             }
+
+            ptr_u8 = ptr_u8.add(3);
         }
 
+        // 'COLD LOOP'
+        // I was hoping to use these clever masking tricks I conjured up ^^
+        // but I found out they don't really work (either my logic was messed up or the need for zero-byte appending)...
+        // the idea was to do some clever masking (including getting lazy to save another mask layer) to extract the appropriate
+        // bits and counterpart bits from the current and prior byte respectively.
+        //
+        // "ab" -> 0x6162 -> 0b[011000][01_0110  ][0010 + 00][000000] -> YWI=
+        // "a"  -> 0x61   -> 0b[011000][01 + 0000][0000 + 00][000000] -> YQ==
+        //
+        // ▲ notice that you can just directly append "=" for r2 and "==" for r1 and still chunk by 3 bytes! ▲
+        //
         // offset           =   2 bits         4 bits       6 bits       (8 bits)      0 bits
         // *b2              = [111111]00 -> 1111]00 00 -> 11]00 0000 -> 00000000 -> [111111]00
         // *b1              =  000000 00 -> 0000 00[11 -> 00 00[1111 -> 00111111 ->  000000 00
         // ^b2 & m (strict) =  000000 00 -> 0000 00 11 -> 00 00 1111 -> 00111111 ->  000000 00
         // ^b2 & m (lazy)   =  111111 00 -> 1111 00 11 -> 11 00 1111 -> 00111111 ->  111111 00
         // ^(^bm & m (l))   =  000000 11 -> 0000 11 00 -> 00 11 0000 -> 11000000 ->  000000 11
-
-        let mask_u6 = 0b11111100; // <-- ver. b2, complement for ver. b1
-        let mask_cc = 0b00000011; // <-- complement AND mask (lazy) (complemented again)
-        let (mut b1, mut b2) = (0u8, 0u8);
-
-        for mi in 0..(len & 0b11) { // <-- guaranteed to be 0-3 loops
-            b2 = ptr_u8.read();
-            ptr_u6.write((b2 & mask_u6 << mi) >> mi & (b1 & !(mask_u6 << mi) & !(mask_cc << mi)) << (8 - mi));
-
-            ptr_u8 = ptr_u8.add(1);
-            ptr_u6 = ptr_u6.add(1);
-            b1 = b2;
-        }
+        //
+        // ▼ nonetheless I still think the logic is really interesting, see if you can tidy this up and make it actually work! ▼
+        //
+        // ```
+        // let mask_u6: u8 = 0b11111100; // <-- ver. b2, complement for ver. b1
+        // let mask_cc: u8 = 0b00000011; // <-- complement AND mask (lazy) (complemented again)
+        // let (mut b1, mut b2) = (0u8, 0u8);
+        //
+        // for mi in 0u32..(len & 0b11) as u32 { // <-- guaranteed to be 0-3 loops
+        //     b2 = ptr_u8.read();
+        //     ptr_u6.write((b2 & mask_u6 << mi) >> mi | (b1 & !(mask_u6 << mi) & !(mask_cc << mi)) << (8 - mi));
+        //
+        //     ptr_u8 = ptr_u8.add(1);
+        //     ptr_u6 = ptr_u6.add(1);
+        //     b1 = b2;
+        // }
+        // ```
 
         // reset pointer position...
         ptr_u6 = ptr_ps.clone();
 
-        // ❷ Unroll and jam loops for base64 conversion! Hot loop is `chunks_exact` filling full SIMD registers, cold loop is part of a register.
+        // ❷ Unroll and jam loops for base64 conversion! Hot loop is `chunks_exact` filling full SIMD(?) registers, cold loop is part of a register.
         // @adapts https://mcyoung.xyz/2023/11/27/simd-base64/#simd-hash-table (technique, `in_range`)
         //
         // raws           hex            maps      ascii
@@ -1321,15 +1414,19 @@ where LaneCount<N>: SupportedLaneCount {
 
             let hun = masked_splat(&mask_upper, b'A' as i8) |
                 masked_splat(&mask_lower, (b'a' - 26) as i8) |
-                masked_splat(&mask_numeric, (52 - b'0') as i8) |
-                masked_splat(&mask_pluses, (62 - b'+') as i8) |
-                masked_splat(&mask_slashes, (63 - b'/') as i8);
+                masked_splat(&mask_numeric, b'0' as i8 - 52) |
+                masked_splat(&mask_pluses, b'+' as i8 - 62) |
+                masked_splat(&mask_slashes, b'/' as i8 - 63);
 
-            let ptr_hun = hun.cast::<u8>()[..].as_ptr();
+            let ptr_hun = (hun.cast::<u8>() + chu)[..].as_ptr();
 
             ptr::copy_nonoverlapping(ptr_hun, ptr_u6, N);
-            ptr_u6 = ptr_u6.add(N);
+            ptr_u6 = ptr_u6.add(N); // <-- `ptr_u6` won't point to end of string but sometimes a bit ahead, hence cannot backtrack from relative. instead...
         }
+
+        // overwrite garbage bytes with padding characters by resetting and reusing `ptr_u6`
+        ptr_u6 = ptr_ps.add(len - pad);
+        ptr_u6.write_bytes(b'=', pad);
 
         String::from_utf8(Vec::from_raw_parts(ptr_ps, len, len))
     }
@@ -1345,8 +1442,23 @@ where LaneCount<N>: SupportedLaneCount {
 mod tests {
     use super::*;
 
+    #[inline(always)]
+    fn base64_test(content: &str, expected: &str) {
+        let res4 = str2base64::<4>(content).unwrap();
+        let res8 = str2base64::<8>(content).unwrap();
+        let res16 = str2base64::<16>(content).unwrap();
+        let res32 = str2base64::<32>(content).unwrap();
+        let res64 = str2base64::<64>(content).unwrap();
+
+        assert_eq!(res4, expected);
+        assert_eq!(res8, expected);
+        assert_eq!(res16, expected);
+        assert_eq!(res32, expected);
+        assert_eq!(res64, expected);
+    }
+
     #[test]
-    fn genrc_decl_parsing() {
+    fn grc_decl_parsing() {
         let (re1, re2) = (Regex::new(REGEX_DECL_VALID).unwrap(), Regex::new(REGEX_DECL_INVALID).unwrap());
         let yaml1 = r"\newcommand{\comm}[1]{\;\text{#1}\;}";
         let yaml2 = r"\newcommand{\zq}{\phantom{}^2}";
@@ -1366,7 +1478,7 @@ mod tests {
     }
 
     #[test]
-    fn genrc_regex() {
+    fn grc_regex() {
         let (re1, re2) = (Regex::new(REGEX_SEG_D1).unwrap(), Regex::new(REGEX_SEG_ANY).unwrap());
         assert!(re1.is_match("**1.**").unwrap());
         assert!(!re1.is_match("jiawejifajweifjaiwejf").unwrap());
@@ -1375,4 +1487,86 @@ mod tests {
         assert!(!re2.is_match("*(a)**").unwrap());
     }
 
+    #[test]
+    fn grc_preproc() {
+        // &TRIM_COMM
+        let re_comms = Regex::new(REGEX_COMMS).unwrap();
+        let res = re_comms.replace_all("%%test%%", "");
+        assert_eq!(res, "");
+
+        // &DEFINE(_, _)
+        let re_def = Regex::new(REGEX_PREPROC_DEFINE).unwrap();
+        let res = regextract_n(&re_def, "&DEFINE(wario, mario)", ["ident", "value"]);
+        print!("");
+    }
+
+    #[test]
+    fn base64_sm_rl_symm() {
+        base64_test("000", "MDAw");
+    }
+
+    #[test]
+    fn base64_sm_rl_asymm() {
+        base64_test("ABC", "QUJD");
+    }
+
+    #[test]
+    fn base64_sm_rf0() {
+        base64_test("ab", "YWI=");
+    }
+
+    #[test]
+    fn base64_sm_rf1() {
+        base64_test("a", "YQ==");
+    }
+
+    #[test]
+    fn base64_med_rl0() {
+        base64_test("ABCDEFGHIJKL", "QUJDREVGR0hJSktM");
+    }
+
+    #[test]
+    fn base64_med_rl_spaces() {
+        base64_test("these are words you should convert into base64 lolz", "dGhlc2UgYXJlIHdvcmRzIHlvdSBzaG91bGQgY29udmVydCBpbnRvIGJhc2U2NCBsb2x6");
+    }
+
+    #[test]
+    fn base64_med_rl1() {
+        base64_test("293jf9j3292i40o0245$=", "MjkzamY5ajMyOTJpNDBvMDI0NSQ9");
+    }
+
+    #[test]
+    fn base64_med_rl_uni0() {
+        base64_test("語 Φ Д Δ ㅂ و ߐ ሀ ހ ઘ  ஊ అ ഗ Ꮳ ᚨ 𐌀 ee𐤀", "6KqeIM6mINCUIM6UIOOFgiDZiCDfkCDhiIAg3oAg4KqYICDgroog4LCFIOC0lyDhj6Mg4ZqoIPCQjIAgZWXwkKSA");
+    }
+
+    #[test]
+    fn base64_med_rl_uni1() {
+        base64_test("�����������������������������", "77+977+977+977+977+977+977+977+977+977+977+977+977+977+977+977+977+977+977+977+977+977+977+977+977+977+977+977+977+9");
+    }
+
+    #[test]
+    fn base64_med_rl_uni2() {
+        base64_test("﷐﷑﷒﷓﷔﷕﷖﷗﷘﷙﷚﷛﷜﷝﷞﷟﷠﷡﷢﷣", "77eQ77eR77eS77eT77eU77eV77eW77eX77eY77eZ77ea77eb77ec77ed77ee77ef77eg77eh77ei77ej");
+    }
+
+    #[test]
+    fn base64_sm_rl_all() {
+        base64_test("EKN<", "wavzBEVL2048/+");
+    }
+
+    #[test]
+    fn base64_med_rf0() {
+        base64_test("abcjiawefjaiweawe", "YWJjamlhd2VmamFpd2Vhd2U=");
+    }
+
+    // #[test]
+    // fn base64_lg_rl() {
+    //     let content = MarkdownDoc::new("assi13.md").compile();
+    //     let res4 = str2base64::<4>(&*content).unwrap();
+    //     let res8 = str2base64::<8>(&*content).unwrap();
+    //     let res16 = str2base64::<16>(&*content).unwrap();
+    //     let res32 = str2base64::<32>(&*content).unwrap();
+    //     let res64 = str2base64::<64>(&*content).unwrap();
+    // }
 }
