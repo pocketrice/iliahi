@@ -52,7 +52,7 @@ decls:
     macro: "\\cdot"
     pc: 0
   - id: vw
-    macro: "\\b{w}"
+    macro: "\\bs{w}"
     pc: 0
   - id: vd
     macro: "\\vdots"
@@ -121,7 +121,7 @@ decls:
     macro: "\\vec{#1}\\cdot \\vec{#2}"
     pc: 2
   - id: dcm
-    macro: "\\left|\\arr{\\b{}\\b{i} & \\b{j} & \\b{k} \\\\ #1 \\\\ #2}\\right|"
+    macro: "\\left|\\arr{\\bs{}\\bs{i} & \\bs{j} & \\bs{k} \\\\ #1 \\\\ #2}\\right|"
     pc: 2
   - id: vi
     macro: "\\vec{i}"
@@ -136,28 +136,28 @@ decls:
     macro: "\\mbn{n}{n}"
     pc: 0
   - id: vj
-    macro: "\\b{j}"
+    macro: "\\bs{j}"
     pc: 0
   - id: vk
-    macro: "\\b{k}"
+    macro: "\\bs{k}"
     pc: 0
   - id: vu
-    macro: "\\b{u}"
+    macro: "\\bs{u}"
     pc: 0
   - id: vv
-    macro: "\\b{v}"
+    macro: "\\bs{v}"
     pc: 0
   - id: vx
-    macro: "\\b{x}"
+    macro: "\\bs{x}"
     pc: 0
   - id: vy
-    macro: "\\b{y}"
+    macro: "\\bs{y}"
     pc: 0
   - id: ve
-    macro: "\\b{e}"
+    macro: "\\bs{e}"
     pc: 0
   - id: vz
-    macro: "\\b{z}"
+    macro: "\\bs{z}"
     pc: 0
   - id: o
     macro: "\\cdot"
@@ -172,7 +172,7 @@ decls:
     macro: "\\sqrt{ (#1)^2+(#2)^2 }"
     pc: 2
   - id: nm
-    macro: "||\\b{#1}||"
+    macro: "||\\bs{#1}||"
     pc: 1
   - id: sun
     macro: "\\subseteq"
@@ -193,7 +193,7 @@ decls:
     macro: "\\mathbf{#1}"
     pc: 1
   - id: cp
-    macro: "\\b{#1}\\times\\b{#2}"
+    macro: "\\bs{#1}\\times\\bs{#2}"
     pc: 2
   - id: vtrail
     macro: "\\crap{\\vv_{1},\\vv_{2}\\dots\\vv_{m}}"
@@ -250,7 +250,7 @@ decls:
     macro: "\\phantom{}^2"
     pc: 0
   - id: nq
-    macro: "\\vspace{1cm}\\\\"
+    macro: "\\vspace{0.7cm}\\\\"
     pc: 0
   - id: sq
     macro: "\\sqe\\\\"
@@ -266,6 +266,72 @@ decls:
     pc: 1
   - id: qu
     macro: "\\;\\;"
+    pc: 0
+  - id: nil
+    macro: e
+    pc: 0
+  - id: f
+    macro: "\\qqqqq"
+    pc: 0
+  - id: ff
+    macro: "\\f\\f"
+    pc: 0
+  - id: fff
+    macro: "\\ff\\f"
+    pc: 0
+  - id: ffff
+    macro: "\\ff\\ff"
+    pc: 0
+  - id: induct
+    macro: "(\\forall n \\in #1)\\Big(P(n) \\implies P(n+1)\\Big)"
+    pc: 1
+  - id: bp
+    macro: "\\Big(#1\\Big)"
+    pc: 1
+  - id: bx
+    macro: "\\boxed{#1}"
+    pc: 1
+  - id: rspace
+    macro: "\\mathbb{R}^{#1}"
+    pc: 1
+  - id: bbq
+    macro: "\\mathbb{Q}"
+    pc: 0
+  - id: bicond
+    macro: "\\iff"
+    pc: 0
+  - id: thing
+    macro: "\\;#1\\;"
+    pc: 1
+  - id: contra
+    macro: "\\Rightarrow\\Leftarrow"
+    pc: 0
+  - id: nni
+    macro: "\\cancel{\\in}"
+    pc: 0
+  - id: nrt
+    macro: "\\sqrt[#1]{ #2 }"
+    pc: 2
+  - id: dime
+    macro: "\\affix{dim}\\;#1"
+    pc: 1
+  - id: bs
+    macro: "\\mathbf{#1}"
+    pc: 1
+  - id: viz
+    macro: "\\vec{0}"
+    pc: 0
+  - id: ems
+    macro: "\\emptyset"
+    pc: 0
+  - id: sesu
+    macro: "\\setminus"
+    pc: 0
+  - id: msu
+    macro: "\\bigcup^\\infty_{n=1}"
+    pc: 0
+  - id: msn
+    macro: "\\bigcap^\\infty_{n=1}"
     pc: 0
 statics:
   - "\\definecolor{final}{HTML}{e2e2e2}"

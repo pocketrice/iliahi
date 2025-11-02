@@ -28,21 +28,20 @@ type Fmtr<'a> = &'a str;
 
 
 // changelog
-// 0.0.1 ... supports basic features (no preproc/db)
-// 0.1.0 ... decls rewrite to use db
-// 0.1.1 ... statics support to db, .lhi files
-// 0.1.2 ... preprocessor experimentation, migration to nightly
-// 0.2.0 ... preprocessor support, hyperoptim base64
-// 0.3.0 ... simple URL validation, export to overleaf finished
+// 0.1.x ... supports basic features (no preproc/db)
+// 0.2.x ... decls rewrite to use db
+// 0.3.x ... statics support to db, .lhi files
+// 0.4.x ... preprocessor experimentation, migration to nightly
+// 0.5.x ... preprocessor support, hyperoptim base64
+// 0.6.x ... simple URL validation, export to overleaf finished
+// 1.0.0 ... adapted from overleaf to pdflatex conversion
 
-// 0.3.1 ... multi/recursive FmtStr? full URL/URI validation?
-// 0.4.0 ... table parsing?
-
-static VERSION_NUM: &str = "0.2.0";
-static VERSION_BRANCH: &str = "stable";
+static VERSION_NUM: &str = "1.0.0";
+static VERSION_BRANCH: &str = "ALPHA";
 
 
 static FMT_ANCHOR: &str = "{}";
+static SEG_SENTINEL: &str = "*(S)*";
 static REGEX_META_NCAP: &str = r".*\(\?P<(?P<ncap>.+)>.*\).*"; // <-- note, this means only limited to one named capture group for regmerge!
 static REGEX_SEG_D1: &str = r"\*\*(?P<eid>.+)\.\*\*";
 static REGEX_SEG_D2: &str = r"\*\((?P<eid>.+)\)\*";
@@ -354,6 +353,10 @@ impl PreprocessorDirective {
 
 
                     // ❶ Inject 1..n-1 segments finals, skipping if final found in segment.
+                    // ❷ Using 2 sentinel values, does a clever inject of nth segment as well.
+                    content.push(String::from(SEG_SENTINEL));
+                    content.push(String::from(SEG_SENTINEL));
+
                     let mut seg_needs_final = true;
                     for i in 1..(content.len()-2) {
                         // SAFETY: entering for loop = guaranteed chunk size of 3, indices never overlap.
@@ -362,7 +365,7 @@ impl PreprocessorDirective {
 
                         if re_final.is_match(curr).unwrap() { seg_needs_final = false; }
 
-                        if re_seg.is_match(peek).unwrap() { // <-- final injection should occur on curr or pre... depending on if \n is present before segment identifier
+                        if !re_seg.is_match(curr).unwrap() && re_seg.is_match(peek).unwrap() { // <-- final injection should occur on curr or pre... depending on if \n is present before segment identifier
                             if seg_needs_final {
                                 let mut target = if curr.is_empty() { pre } else { curr };
 
@@ -375,10 +378,8 @@ impl PreprocessorDirective {
                         }
                     }
 
-                    // ❷ Inject nth segment final
-                    if seg_needs_final {
-                        
-                    }
+                    content.pop();
+                    content.pop();
                 },
                 PreprocessorDirective::IgnoreDecls => { //                          <-- although this may technically be "local" rather "global", if decl notation changes and must be inspected relatively this helps.
                     let re_declv = Regex::new(REGEX_DECL_VALID).unwrap();//      additionally, as this is simply a remove operation I feel a simple `retain` may be more performant
@@ -771,9 +772,9 @@ impl Segment {
                     .collect::<Vec<String>>()
                     .join("\n");
 
-                format!("\\item[{}]\n\\begin{{enumerate}}{}\\end{{enumerate}}\n\\nq", eid, con)
+                format!("\\item[{}]\n\\begin{{enumerate}}{}\\nq\\end{{enumerate}}\n", eid, con)
             },
-            Right(con) => format!("\\item[{}]\n{}\n\\nq", eid, con)
+            Right(con) => format!("\\item[{}]{}\\sqe", eid, con)
         }
     }
 }
@@ -1107,9 +1108,9 @@ fn parse_decls(yamls: &Yaml) -> String {
                 .unwrap_or(0);
 
             let decl = if pc == 0 {
-                format!("\\newcommand{{\\{}}}{{{}}}\n", id, mac)
+                format!("\\providecommand{{\\{}}}{{{}}}\n", id, mac)
             } else {
-                format!("\\newcommand{{\\{}}}[{}]{{{}}}\n", id, pc, mac)
+                format!("\\providecommand{{\\{}}}[{}]{{{}}}\n", id, pc, mac)
             };
 
             decls.push_str(&decl);
@@ -1220,15 +1221,15 @@ pub fn export_overleaf(tex: TeXContent, should_bc: bool) -> Result<URI, Error> {
             format!("data:application/x-tex;base64,{}", t)
         )?; // guaranteed valid
 
-            println!("{}", reqt.compile());
-
-            let reqt = HTTPRequest::new(
-                HTTPMethod::GET,
-                URI::new_unchecked("https://www.overleaf.com:80"),
-                1.1,
-                hash_map![],
-                String::new(),
-            )?;
+            // println!("{}", reqt.compile());
+            //
+            // let reqt = HTTPRequest::new(
+            //     HTTPMethod::GET,
+            //     URI::new_unchecked("https://www.overleaf.com:80"),
+            //     1.1,
+            //     hash_map![],
+            //     String::new(),
+            // )?;
 
         let resp = http_request_expect(reqt, Duration::from_secs(HTTP_RW_TIMEOUT_SEC), Duration::from_secs(HTTP_RW_TIMEOUT_SEC), HTTP_RW_MAX_ATTEMPTS, HTTP_RW_MAX_ATTEMPTS, true)?;
         URI::new(&FmtStr::only_fmt(OVERLEAF_URL, &resp.payload)?)
@@ -1349,7 +1350,8 @@ fn query(msg: &str) -> String {
 /// Cannot guarantee that immediate next token contains matching EID so must manually pass the constructed segment's EID.
 /// Likewise, cannot know what to use to end stepping so must manually pass in delimiting pattern.
 fn consume_segment<I: Iterator<Item = String>>(content: &mut Peekable<I>, delim: &Regex, eid: Label) -> Segment {
-    let mut body = String::new();
+    let mut body = content.next().unwrap(); // <-- no add'l formatting for initial segment separator. This should always exist.
+    body.push('\n');
     let re_qq = Regex::new(REGEX_USES_QQ).unwrap();
 
     //let eid = regextract(delim, &content.next().unwrap(), "eid").unwrap();
@@ -1362,7 +1364,7 @@ fn consume_segment<I: Iterator<Item = String>>(content: &mut Peekable<I>, delim:
 
         let append = match &line {
             l if l.is_empty() => {
-                String::from("\\\\\n")
+                String::from("\\\\")
             },
 
             l if l.eq(LINE_BREAK) => {
@@ -1370,11 +1372,11 @@ fn consume_segment<I: Iterator<Item = String>>(content: &mut Peekable<I>, delim:
             }
 
             l if is_qq => {
-                format!("\\\\\n\n{}", &l).to_string()
+                format!("\n\n{}", &l).to_string()
             },
 
             l => {
-                format!("\\\\\n{}", &l).to_string()
+                format!("\n\n{}", &l).to_string()
             }
         };
 
