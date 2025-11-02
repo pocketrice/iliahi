@@ -8,3 +8,5 @@ fancy-regex = "0.16.1"
 yaml-rust = { version = "0.10.3", package = "yaml-rust2" }
 either = "1.15.0"
 chrono = "0.4.42"
+anyhow = "1.0.100"
+map-macro = "0.3.0"

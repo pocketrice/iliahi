@@ -1,35 +1,42 @@
 #![feature(portable_simd, vec_into_raw_parts, if_let_guard)]
 
-use either::{Either, Left, Right};
-use std::alloc::{alloc_zeroed, Layout};
-use std::fs::{File, OpenOptions};
-use std::io::{stdin, stdout, BufRead, BufReader, Write};
-use std::{fs, ptr};
+use anyhow::Error;
+use anyhow::{anyhow, bail};
 use chrono::{Datelike, Local};
+use either::{Either, Left, Right};
 use fancy_regex::{Captures, Regex};
-use std::iter::{Peekable};
-use std::ops::{RangeBounds};
+use map_macro::hash_map;
+use std::alloc::{alloc_zeroed, Layout};
+use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
+use std::io::{stdin, stdout, BufRead, BufReader, Read, Write};
+use std::iter::Peekable;
+use std::net::TcpStream;
+use std::ops::RangeBounds;
 use std::process::{Command, Stdio};
-use std::simd::{LaneCount, Mask, Simd, SupportedLaneCount};
 use std::simd::prelude::{SimdInt, SimdPartialOrd};
+use std::simd::{LaneCount, Mask, Simd, SupportedLaneCount};
 use std::slice::SliceIndex;
+use std::str::FromStr;
 use std::string::FromUtf8Error;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+use std::{fs, ptr};
 use yaml_rust::{yaml, Yaml, YamlEmitter, YamlLoader};
 
 type TeXContent = String;
-type URL = String;
 type Fmtr<'a> = &'a str;
 
 
 // changelog
 // 0.0.1 ... supports basic features (no preproc/db)
 // 0.1.0 ... decls rewrite to use db
-// 0.1.1 ... (+) statics support to db, .lhi files
+// 0.1.1 ... statics support to db, .lhi files
 // 0.1.2 ... preprocessor experimentation, migration to nightly
-// 0.2.0 ... (+) preprocessor support, hyperoptim base64/overleaf export
+// 0.2.0 ... preprocessor support, hyperoptim base64
+// 0.3.0 ... simple URL validation, export to overleaf finished
 
-// 0.2.1 ... (+) table parsing?
+// 0.3.1 ... multi/recursive FmtStr? full URL/URI validation?
+// 0.4.0 ... table parsing?
 
 static VERSION_NUM: &str = "0.2.0";
 static VERSION_BRANCH: &str = "stable";
@@ -48,6 +55,14 @@ static REGEX_USES_QQ: &str = r"((\\(q+|[;,>:]|(hspace)))*)(?<nq>.+)";
 static REGEX_COMMS: &str = "%{2}.*?%{2}";
 static REGEX_PREPROC_DEFINE: &str = r"^&DEFINE *\( *(?<ident>.+?) *, *(?<value>.*? *)\)$";
 static REGEX_PREPROC_INCLUDE: &str = r"^&INCLUDE *\( *(?<ident>.+?)\.lhi *\)$";
+static REGEX_URI: &str = r"(?<scheme>[a-zA-Z][a-zA-Z0-9+\-.]*):(?<authority>\/\/(?<host>([a-zA-Z0-9]+\.)*[a-zA-Z0-9]+)(:(?<port>[0-9]+))?)?(\/(?<path>([A-Za-z0-9:@!$&'()*+,;=]+)*))(\?(?<query>[0-9A-Za-z:@!$&'()*+,;=\-._~\/]+))?(\#(?<fragment>[0-9A-Za-z:@!$&'()*+,;=\-._~\/]+))?";
+/// note this is a workaround for retrieving URI authority `dyn Identifier` replacing `URI`. This assumes the URI is already valid and is absolute (of type `URI`).
+static REGEX_URI_AUTH: &str = r".*\/\/(?<authority>([a-zA-Z0-9]+\.)*[a-zA-Z0-9]+(:[0-9]+)?).*";
+static REGEX_REL_URI: &str = r"\/(?<path>([A-Za-z0-9:@!$&'()*+,;=]+)*)(\?(?<query>[0-9A-Za-z:@!$&'()*+,;=\-._~\/]+))?(\#(?<fragment>[0-9A-Za-z:@!$&'()*+,;=\-._~\/]+))?";
+static REGEX_HTTP_HEADER: &str = r"^[A-Z][a-z]+(-[A-Z][a-z]+)*$";
+static HTTP_VERSIONS: [f32; 5] = [0.9, 1.0, 1.1, 2.0, 3.0];
+static HTTP_RW_TIMEOUT_SEC: u64 = 5;
+static HTTP_RW_MAX_ATTEMPTS: usize = 3;
 
 // static REGEX_QQ: &str = r"(\\(q+|[;,>:]|(hspace)))";
 
@@ -101,18 +116,169 @@ macro_rules! matches_n {
         }
 }
 
+/// Generalized representation of an identifier, most commonly a URI.
+/// What is needed is simply a way to resolve to absolute standalone identifier; already absolute identifiers
+/// may simply return something akin to `self::compile`.
+pub trait Identifier {
+    fn resolve(&self, auri: Option<URI>) -> Result<String, Error>; // compile absolute
+    fn compile(&self) -> String; // compile current (relative or absolute). the identifier should have already been verified, so no need for `Result<String, Error>`.
+}
+
+#[derive(Debug)]
+pub struct URI {
+    scheme: String,          //     https://         ...
+    host: Option<String>,    // ... en.wikipedia.org ...
+    port: Option<u16>,       // ... :443             ...
+    path: String,            // ... /wiki/URI        ...
+    query: Option<String>,   // ... ?t=253           ...
+    fragment: Option<String> // ... #History
+}
+impl URI {
+    pub fn new(uri: &str) -> Result<URI, Error> {
+        let re_uri = Regex::new(REGEX_URI)?;
+        let [scheme, host, port, path, query, fragment] = regextract_n(&re_uri, uri, ["scheme", "host", "port", "path", "query", "fragment"]);
+
+        if scheme.is_some() && path.is_some() { // note that no other checks needed, if they are malformed and bleed into another section it would not cause this destructuring to "miss" it since it's now in that other section.
+            Ok(URI {
+                scheme: scheme.unwrap(),
+                host,
+                port: port.map(|s| u16::from_str(&s)).transpose().unwrap_or(None),
+                path: path.unwrap(),
+                query,
+                fragment,
+            })
+        } else {
+            Err(anyhow!("Malformed URI"))
+        }
+    }
+
+    pub fn new_unchecked(uri: &str) -> URI {
+        URI::new(uri).unwrap()
+    }
+
+    pub fn authority(&self) -> Option<String> {
+        match &self.host {
+            Some(h) if let Some(port) = self.port => Some(format!("{}:{}", h, port)),
+            Some(h) => Some(h.to_string()),
+            None => None
+        }
+    }
+}
+
+impl Identifier for URI {
+    fn resolve(&self, _auri: Option<URI>) -> Result<String, Error> {
+        Ok(self.compile())
+    }
+
+    fn compile(&self) -> String {
+        let auth = self.authority().map(|mut a| { a.push('/'); a } ).unwrap_or(String::new());
+
+        let query = match &self.query { // <-- as per note that while "self.query.map(|q| format!("?{}", q)).unwrap_or(String::new())" necessitates taking, you can use match ergonomics to wholly work in refland!
+            Some(q) => format!("?{}", q),
+            None => String::new()
+        };
+
+        let fragment = match &self.fragment {
+            Some(f) => format!("#{}", f),
+            None => String::new()
+        };
+
+        let mut uri = String::with_capacity(self.scheme.len() + auth.len() + self.path.len() + query.len() + fragment.len() + 3);
+        uri.push_str(&self.scheme);
+        uri.push_str("://");
+        uri.push_str(&auth);
+        uri.push_str(&self.path);
+        uri.push_str(&query);
+        uri.push_str(&fragment);
+
+        uri
+    }
+}
+
+#[derive(Debug)]
+pub struct RelativeURI {
+    path: String,
+    query: Option<String>,
+    fragment: Option<String>,
+}
+
+impl RelativeURI {
+    /// Splits URI into path and residual chunks (note while RFC 3986 requires 'path', it may be empty).
+    pub fn extract(mut uri: URI) -> (RelativeURI, URI) {
+        let (mut path, mut query, mut fragment) = (String::new(), None, None);
+        (uri.path, path) = (path, uri.path);
+        (uri.query, query) = (query, uri.query);
+        (uri.fragment, fragment) = (fragment, uri.fragment);
+
+        (RelativeURI { path, query, fragment }, uri)
+    }
+
+    /// Creates a new relative URI, erring if not valid or relative.
+    pub fn new(rel_uri: &str) -> Result<RelativeURI, Error> {
+        let re_ruri = Regex::new(REGEX_REL_URI).unwrap();
+        match rel_uri {
+            ru if let [Some(path), query, fragment] = regextract_n(&re_ruri, ru, ["path", "query", "fragment"]) => {
+                Ok(RelativeURI { path, query, fragment }) // theoretically path always must match (even empty), so it never fails
+            }
+            _ => Err(anyhow!("Malformed relative URI"))
+        }
+    }
+}
+
+impl Identifier for RelativeURI {
+    /// Resolves the relative URI against an absolute anchor URI. Absolute fragment and query are replaced.
+    fn resolve(&self, auri: Option<URI>) -> Result<String, Error> {
+        match auri {
+            Some(mut a) => { // manual format to avoid moves
+                let auth = a.authority().unwrap_or(String::new());
+                let ruri = self.compile();
+
+                let mut uri = String::with_capacity(a.scheme.len() + auth.len() + ruri.len() + 3);
+                uri.push_str(&a.scheme);
+                uri.push_str("://");
+                uri.push_str(&auth);
+                uri.push_str(&ruri);
+
+                Ok(uri)
+            },
+            None => Err(anyhow!("Relative URI must resolve with an absolute URI")),
+        }
+    }
+
+    fn compile(&self) -> String {
+        let query = match &self.query {
+            Some(q) => format!("?{}", q),
+            None => String::new()
+        };
+
+        let fragment = match &self.fragment {
+            Some(f) => format!("#{}", f),
+            None => String::new()
+        };
+
+        let mut ruri = String::with_capacity(self.path.len() + query.len() + fragment.len() + 1);
+        ruri.push('/');
+        ruri.push_str(&self.path);
+        ruri.push_str(&query);
+        ruri.push_str(&fragment);
+
+        ruri
+    }
+}
+
 /// Representation of a preprocessor directive containing a basic
 /// constructive behavior applied either globally or locally.
 ///
 /// The use of `PreprocessorDirective`s produces a standard .pli preprocessed file.
 pub enum PreprocessorDirective {
-    TrimComms,
-    MarkFinal,
-    Define(String, String),
-    Include(String), // <-- purposefully doesn't abide by IgnoreDecls if you want to selectively append and remove things :)
-    IgnoreDecls, // <-- note, this may seem useless but if you're just using default decl lib then this saves parsing decls!
-    EnforceSpacing,
-    FlatSegs,
+    TrimComms,               // Remove all Markdown (%%...%%) comments.
+    MarkFinal,               // Marks the last lines of each segment as final (if no final is present).
+    Define(String, String),  // Replaces the placeholder string (left) with its value.
+    Include(String),         // Inlines the contents of .lhi file to top of content. <-- purposefully doesn't abide by IgnoreDecls if you want to selectively append and remove things :)
+    IgnoreDecls,             // Ignores all in-line decls in the file. <-- note, this may seem useless but if you're just using default decl lib then this saves parsing decls!
+    EnforceSpacing,          // Spaces each line forcibly even if not originally present.
+    FlatSegs,                // Converts all subsegments, resulting in 1-deep segments.
+
 }
 
 impl PreprocessorDirective {
@@ -121,8 +287,8 @@ impl PreprocessorDirective {
     /// # Caveats
     /// Note that `directive` will be in the form of "(.*)"; note
     /// stripped newline but presence of & identifier.
-    pub fn from(directive: &str) -> Result<PreprocessorDirective, ()> {
-        let (re_def, re_incl) = (Regex::new(REGEX_PREPROC_DEFINE).unwrap(), Regex::new(REGEX_PREPROC_INCLUDE).unwrap());
+    pub fn from(directive: &str) -> Result<PreprocessorDirective, Error> {
+        let (re_def, re_incl) = (Regex::new(REGEX_PREPROC_DEFINE)?, Regex::new(REGEX_PREPROC_INCLUDE)?);
 
         match directive {
             "&TRIM_COMM" => Ok(PreprocessorDirective::TrimComms),
@@ -132,7 +298,7 @@ impl PreprocessorDirective {
             "&FLATTEN" => Ok(PreprocessorDirective::FlatSegs),
             d if let [Some(ident), Some(value)] = regextract_n(&re_def, d, ["ident", "value"]) => Ok(PreprocessorDirective::Define(ident, value)),
             d if let Some(ident) = regextract(&re_incl, d, "ident") => Ok(PreprocessorDirective::Include(ident)), // <-- you could technically throw a fit here for nonexistant lib, but better to save until parse-time anyway. Plus, the mere existence of a directive does not constitute validity.
-            _ => Err(()),
+            _ => Err(anyhow!("Invalid or nonexistent directive")),
         }
     }
 
@@ -186,18 +352,32 @@ impl PreprocessorDirective {
                     // ...turns out this wasn't a tradeoff at all, I can just use some clever indexing lol
                     // take that bchk!!! >:)
 
+
+                    // ❶ Inject 1..n-1 segments finals, skipping if final found in segment.
+                    let mut seg_needs_final = true;
                     for i in 1..(content.len()-2) {
                         // SAFETY: entering for loop = guaranteed chunk size of 3, indices never overlap.
                         // `peek` is borrowed as mut even though it doesn't need to since (a) convinces bchk and (b) prolly saves time as it's 1 access vs. 2.
                         let [pre, curr, peek] = unsafe { content.get_disjoint_unchecked_mut([i-1, i, i+1]) };
-                        if re_seg.is_match(peek).unwrap() { // <-- final injection should occur on curr or pre... depending on if \n is present before segment identifier
-                            let mut target = if curr.is_empty() { pre } else { curr };
-                            if re_final.is_match(&target).unwrap() { break };
 
-                            let nq = regextract(&re_qq, &target, "nq").unwrap();
-                            let seg = (target.len() - nq.len())..;
-                            segpend(&mut target, seg, &fmst);
+                        if re_final.is_match(curr).unwrap() { seg_needs_final = false; }
+
+                        if re_seg.is_match(peek).unwrap() { // <-- final injection should occur on curr or pre... depending on if \n is present before segment identifier
+                            if seg_needs_final {
+                                let mut target = if curr.is_empty() { pre } else { curr };
+
+                                let nq = regextract(&re_qq, &target, "nq").unwrap();
+                                let seg = (target.len() - nq.len())..;
+                                segpend(&mut target, seg, &fmst);
+                            } else {
+                                seg_needs_final = true;
+                            }
                         }
+                    }
+
+                    // ❷ Inject nth segment final
+                    if seg_needs_final {
+                        
                     }
                 },
                 PreprocessorDirective::IgnoreDecls => { //                          <-- although this may technically be "local" rather "global", if decl notation changes and must be inspected relatively this helps.
@@ -260,29 +440,47 @@ pub struct Promise {
 impl Promise {
     /// Create new promise.
     /// Note that this will timestamp automatically at instantiation time and stop at drop.
-    fn new(id: String) -> Promise {
+    pub fn new(id: &str) -> Promise {
         Promise { ident: FmtStr::only_fmt(PROMISE_FMT, &id).unwrap(), ts: None }
     }
 
     /// Creates new promise and wishes upon it, returning promise for fulfillment.
-    fn only_wish(ident: String) -> Promise {
+    pub fn only_wish(ident: &str) -> Promise {
         let mut pr = Promise::new(ident);
         pr.wish();
         pr
     }
 
     /// Wishes the promise, expecting fulfillment.
-    fn wish(&mut self) {
+    pub fn wish(&mut self) {
         self.ts = Some(Instant::now());
         print!("{}", self.ident);
     }
 
     /// Fulfills the promise and outputs based on pass condition, thus closing it.
-    fn fulfill(self, pass: bool) { // <-- more behavior can go here if needed (don't touch Drop; may want to allow a cleanup function etc etc.)
+    pub fn fulfill(self, pass: bool) { // <-- more behavior can go here if needed (don't touch Drop; may want to allow a cleanup function etc etc.)
         let msg = if pass { PROMISE_OK } else { PROMISE_NG };
         println!("{} ({:.3}ms)", msg, self.ts.and_then(|t| Some(t.elapsed().as_micros() as f32 / 1000.0)).unwrap_or(0.0));
     }
+
+    /// Performs and returns [Promise::only_wish] if condition is met, otherwise None.
+    /// This is handy for concise conditional promising using a global like `should_bc` in conjunction with [Promise::fulfill_if].
+    pub fn promise_if(ident: &str, cond: bool) -> Option<Promise> {
+        match cond {
+            true => Some(Promise::only_wish(ident)),
+            false => None
+        }
+    }
+
+    /// Fulfills and closes promise if `Some`, otherwise does nothing (consumes).
+    pub fn fulfill_if(promise: Option<Promise>, pass: bool) {
+        match promise {
+            Some(p) => p.fulfill(pass),
+            None => (),
+        }
+    }
 }
+
 //
 // impl Drop for Promise {
 //     /// Drops and prints 'parting words' for this `Promise`.
@@ -290,6 +488,220 @@ impl Promise {
 //         println!("{} ({:.2}ms)", PROMISE_OK, self.ts.and_then(|t| Some(t.elapsed().as_micros() as f32 / 1000.0)).unwrap_or(0.0));
 //     }
 // }
+
+#[derive(Debug)]
+enum HTTPMethod {
+    GET,
+    HEAD,
+    POST,
+    PUT,
+    DELETE,
+    CONNECT,
+    OPTIONS,
+    TRACE,
+    PATCH
+}
+
+impl HTTPMethod {
+    pub fn new(method: &str) -> Result<HTTPMethod, Error> {
+        match method {
+            "GET" => Ok(HTTPMethod::GET),
+            "HEAD" => Ok(HTTPMethod::HEAD),
+            "POST" => Ok(HTTPMethod::POST),
+            "PUT" => Ok(HTTPMethod::PUT),
+            "DELETE" => Ok(HTTPMethod::DELETE),
+            "CONNECT" => Ok(HTTPMethod::CONNECT),
+            "OPTIONS" => Ok(HTTPMethod::OPTIONS),
+            "TRACE" => Ok(HTTPMethod::TRACE),
+            "PATCH" => Ok(HTTPMethod::PATCH),
+            _ => Err(anyhow!("No such HTTP method"))
+        }
+    }
+}
+
+pub struct HTTPRequest {
+    method: HTTPMethod,
+    uri: Box<dyn Identifier>,
+    http_ver: f32, // relative-indexed versioning (HTTP/0.9, /1.0, /1.1, /2, /3)
+    headers: HashMap<String, String>, // avoid `Header` enum, as custom "X-header" is possible!
+    payload: String, // prefer string over raw bytes; (a) transfer is string anyway and (b) HTTP/1.x is plaintext while HTTP/2 is binary
+
+}
+
+impl HTTPRequest {
+    pub fn new(method: HTTPMethod, uri: URI, http_ver: f32, headers: HashMap<&str, &str>, payload: String) -> Result<Self, Error> {
+        let re_http_header = Regex::new(REGEX_HTTP_HEADER)?;
+
+        let mut headers: HashMap<String, String> = headers.iter().map(|(name, field)| (name.to_string(), field.to_string())).collect(); // convert &str map to String map; prior is for front-facing convenience
+
+        if headers.keys().all(|name| re_http_header.is_match(name).unwrap()) && HTTP_VERSIONS.contains(&http_ver) {
+            Ok(match method {
+                HTTPMethod::POST => {
+                    let (ruri, auri) = RelativeURI::extract(uri);
+                    headers.insert(String::from("Host"), auri.compile());
+                    HTTPRequest { method, uri: Box::new(ruri), http_ver, headers, payload }
+                },
+                _ => HTTPRequest { method, uri: Box::new(uri), http_ver, headers, payload }
+            })
+        } else {
+            Err(anyhow!("Bad HTTP request"))
+        }
+    }
+
+    pub fn from(reqt: &str) -> Result<Self, Error> {
+        let re_http_header = Regex::new(REGEX_HTTP_HEADER)?;
+
+        let mut lines = reqt.lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| l.trim());
+
+        let (method, uri, http_ver) = {
+            if let Some(line) = lines.next() && let [m, u, v, ..] = line.split(' ').collect::<Vec<&str>>()[..] {
+                let nm = HTTPMethod::new(m)?;
+                let nu: Box<dyn Identifier> = match nm {
+                    HTTPMethod::POST => Box::new(RelativeURI::new(u)?),
+                    _ => Box::new(URI::new(u)?),
+                };
+                let nv = f32::from_str(&v.replace("HTTP/", ""))?;
+                if !HTTP_VERSIONS.contains(&nv) {
+                    bail!("Invalid HTTP version: {}", nv)
+                }
+
+                (nm, nu, nv)
+            } else {
+                bail!("Missing initial line or bad format in HTTP request")
+            }
+        };
+
+        let mut headers = HashMap::<String, String>::new();
+        while let Some(line) = lines.next() && re_http_header.is_match(line)? {
+            if let [name, field, ..] = line.split(": ").collect::<Vec<&str>>()[..] {
+                headers.insert(String::from(name), String::from(field));
+            } else {
+               bail!("Bad headers in HTTP request")
+            }
+        }
+
+        let payload = lines.collect::<Vec<&str>>().join(" ");
+
+        Ok(HTTPRequest { method, uri, http_ver, headers, payload })
+    }
+
+    pub fn compile(self) -> String {
+        format!("{:?} {:?} HTTP/{}\n{}\n{}",
+                self.method, self.uri.compile(), self.http_ver, // <-- note! prior `self.uri.resolve(auri)` was throwing "cannot move a value of type 'dyn Identifier'; per https://stackoverflow.com/a/76038535/30291565 trait objects must act only on &self not self
+                self.headers.iter().map(|(name, field)| format!("{}: {}", name, field)).collect::<Vec<_>>().join("\n"),
+                self.payload)
+    }
+}
+
+pub struct HTTPResponse {
+    http_ver: f32,
+    status: u16,
+    reason: String,
+    headers: HashMap<String, String>,
+    payload: String,
+}
+
+impl HTTPResponse {
+    pub fn new(http_ver: f32, status: u16, reason: String, headers: HashMap<&str, &str>, payload: String) -> Result<Self, Error> {
+        let re_http = Regex::new(REGEX_HTTP_HEADER).unwrap();
+
+        let headers: HashMap<String, String> = headers.iter().map(|(name, field)| (name.to_string(), field.to_string())).collect();
+
+        if headers.keys().all(|name| re_http.is_match(name).unwrap()) && HTTP_VERSIONS.contains(&http_ver) {
+            Ok(HTTPResponse { http_ver, status, reason, headers, payload })
+        } else {
+            Err(anyhow!("Bad HTTP response"))
+        }
+    }
+
+    pub fn from(resp: &str) -> Result<Self, Error> {
+        let re_http_header = Regex::new(REGEX_HTTP_HEADER)?;
+
+        let mut lines = resp.lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| l.trim());
+
+        let (http_ver, status, reason) = {
+            if let Some(line) = lines.next() && let [v, s, r, ..] = line.split(' ').collect::<Vec<&str>>()[..] {
+                let nv = f32::from_str(&v.replace("HTTP/", ""))?;
+                if !HTTP_VERSIONS.contains(&nv) {
+                    bail!("Invalid HTTP version: {}", nv)
+                }
+
+                (nv, u16::from_str(s)?, r.to_string())
+            } else {
+                bail!("Missing initial line or bad format in HTTP response")
+            }
+        };
+
+        let mut headers = HashMap::<String, String>::new();
+        while let Some(line) = lines.next() && re_http_header.is_match(line)? {
+            if let [name, field, ..] = line.split(": ").collect::<Vec<&str>>()[..] {
+                headers.insert(String::from(name), String::from(field));
+            } else {
+                bail!("Bad headers in HTTP response")
+            }
+        }
+
+        let payload = lines.collect::<Vec<&str>>().join(" ");
+
+        Ok(HTTPResponse { http_ver, status, reason, headers, payload })
+    }
+
+    pub fn compile(self) -> String {
+        format!("HTTP/{} {} {}\n{}\n{}",
+                self.http_ver, self.status, self.reason,
+                self.headers.iter().map(|(name, field)| format!("{}: {}", name, field)).collect::<Vec<_>>().join("\n"),
+                self.payload)
+    }
+}
+
+fn http_request_expect(reqt: HTTPRequest, r_timeout: Duration, w_timeout: Duration, r_max_attempts: usize, w_max_attempts: usize, should_bc: bool) -> Result<HTTPResponse, Error> {
+    let (reqt, mut resp) = (reqt.compile(), String::new());
+    let auth_cand = regextract(&Regex::new(REGEX_URI_AUTH).unwrap(), &reqt, "authority");
+
+    if let Some(auth) = auth_cand {
+        || -> Result<HTTPResponse, Error> { // "try-catch" behavior adapted https://stackoverflow.com/a/55756926/30291565
+            let pr_con = Promise::promise_if("\n▶ Connecting", should_bc);
+
+            let mut stream = TcpStream::connect(auth)?;
+            stream.set_read_timeout(Some(r_timeout))?;
+            stream.set_write_timeout(Some(w_timeout))?;
+
+            Promise::fulfill_if(pr_con, true);
+
+
+
+            let pr_write = Promise::promise_if("▶ Writing", should_bc);
+
+            let mut reqt_attempts = 0usize;
+            while let Err(_) = stream.write(reqt.as_bytes()) {
+                reqt_attempts += 1;
+                if reqt_attempts > w_max_attempts { bail!("Exceeded max request write attempts")}
+            }
+
+            Promise::fulfill_if(pr_write, true);
+
+
+
+            let pr_read = Promise::promise_if("▶ Reading", should_bc);
+
+            reqt_attempts = 0;
+            while let Err(_) = stream.read_to_string(&mut resp) {
+                reqt_attempts += 1;
+                if reqt_attempts > r_max_attempts { bail!("Exceeded max request read attempts")}
+            }
+
+            Promise::fulfill_if(pr_read, true);
+
+            HTTPResponse::from(&resp)
+        }()
+    } else {
+        Err(anyhow!("HTTP request failed or timed out"))
+    }
+}
 
 /// Constrained representation of a 1-sub decorated label.
 /// Effectively a wrapped version of `FmtStr`.
@@ -301,10 +713,10 @@ pub struct Label {
 
 impl Label {
     /// Creates new `Label` from parts, erring if a valid 1-sub `FmtStr` cannot be created.
-    fn new(ident: String, ornament: String) -> Result<Label, ()> {
+    fn new(ident: String, ornament: String) -> Result<Label, Error> {
         match FmtStr::from(&ornament) {
             Ok(fmts) => Ok(Label { ident, ornament: fmts }),
-            Err(_) => Err(()),
+            Err(e) => Err(e),
         }
     }
 
@@ -316,7 +728,7 @@ impl Label {
     /// e.g.: "({a})" or "{3}."
     ///
     /// format: \[ornament half] { \[ident] } \[ornament half]
-    fn from(str: String) -> Result<Label, ()> {
+    fn from(str: String) -> Result<Label, Error> {
         // note: the label string must distinguish ident and ornament by wrapping ident with {}.
         // e.g.: "({a})" or "{3}."
         // format: [ornament half] { [ident] } [ornament half]
@@ -327,7 +739,7 @@ impl Label {
 
             Ok(Label::new(ident.to_string(), ornament)?)
         } else {
-            Err(())
+            Err(anyhow!("Bad label collation"))
         }
 
     }
@@ -387,12 +799,12 @@ impl FmtStr {
     /// # Caveats
     /// Note that this does not include the anchor; also assumed use of
     /// `FMT_ANCHOR` to represent the anchor.
-    pub fn from(fmt_str: &str) -> Result<FmtStr, ()> {
+    pub fn from(fmt_str: &str) -> Result<FmtStr, Error> {
         if fmt_str.contains(FMT_ANCHOR) {
             let (orna_l, orna_h) = fmt_str.split_once(FMT_ANCHOR).unwrap();
             Ok(FmtStr::new(orna_l, orna_h))
         } else {
-            Err(())
+            Err(anyhow!("Bad fmtstr collation"))
         }
     }
 
@@ -402,7 +814,7 @@ impl FmtStr {
     /// # Caveats
     /// Note that this does not include the anchor; also assumed use of
     /// `FMT_ANCHOR` to represent the anchor.
-    pub fn only_fmt(fmt_str: &str, anchor: &dyn ToString) -> Result<String, ()> { // <-- **NEW** this is a new paradigm I'm designing to signify concise (but expensive) make-and-toss operations... OR shortcutting a single-time operation (like a fuse).
+    pub fn only_fmt(fmt_str: &str, anchor: &dyn ToString) -> Result<String, Error> { // <-- **NEW** this is a new paradigm I'm designing to signify concise (but expensive) make-and-toss operations... OR shortcutting a single-time operation (like a fuse).
         let fmstr = FmtStr::from(fmt_str);
         fmstr.and_then(|fs| Ok(fs.fmt(anchor)))
     }
@@ -453,7 +865,7 @@ impl MarkdownDoc {
             .filter_map(|l| l.ok().and_then(|s| Some(s.trim().to_string())))
             .collect::<Vec<String>>();
 
-        let pr_prep = Promise::only_wish(String::from("Preprocessing"));
+        let pr_prep = Promise::only_wish("Preprocessing");
 
         let mut content = preprocess_content(content)
             .into_iter()
@@ -465,7 +877,7 @@ impl MarkdownDoc {
 
 
         // Take first (and only) document in YAML db.
-        let pr_decls = Promise::only_wish(String::from("Injecting decls"));
+        let pr_decls = Promise::only_wish("Injecting decls");
 
         let mut doc = open_db();
         let cold_decls = doc["decls"].as_mut_vec().expect("Bad decls array"); // TODO fill hole of expectation sadness
@@ -524,7 +936,7 @@ impl MarkdownDoc {
         pr_decls.fulfill(true);
 
         // Parse segments. Depth of 2 for now.
-        let pr_segs = Promise::only_wish(String::from("Parsing segments"));
+        let pr_segs = Promise::only_wish("Parsing segments");
 
         let mut segs: Vec<Segment> = Vec::new();
         //let (mut eid1, mut eid2) = (1, 'a');
@@ -565,7 +977,7 @@ impl MarkdownDoc {
 
     /// Compiles a prepared AMD document into TeX, via injecting decls and substituting content into TeX template.
     pub fn compile(&self) -> TeXContent {
-        let pr = Promise::only_wish(String::from("Compiling"));
+        let pr = Promise::only_wish("Compiling");
 
         let doc = open_db();
 
@@ -782,15 +1194,48 @@ pub fn preprocess_content(mut content: Vec<String>) -> Vec<String> {
 }
 
 /// Generates new Overleaf document from given TeX content via URL base64 payload encoding.
+/// Prints "encoding" and "exporting" promises if enabled.
 ///
 /// # Caveats
-/// Errs if content could not be converted to base64.
-pub fn send_to_overleaf(tex: TeXContent) -> Result<URL, FromUtf8Error> {
+/// Errs if content could not be converted to base64 or failed to send/receive TCP payload to Overleaf servers.
+pub fn export_overleaf(tex: TeXContent, should_bc: bool) -> Result<URI, Error> {
     // Encode into base64 (adapt from https://mcyoung.xyz/2023/11/27/simd-base64/#ascii-to-sextet)
-    let tex_b64 = str2base64::<BASE64_VECTOR_SIZE>(&tex);
+    let pr_enc = Promise::promise_if("Encoding", should_bc);
 
-    // Parse into URL
-    tex_b64.and_then(|t| Ok(FmtStr::only_fmt(OVERLEAF_URL, &t).unwrap()))
+    let bex = str2base64::<BASE64_VECTOR_SIZE>(&tex);
+
+    Promise::fulfill_if(pr_enc, true);
+
+
+
+    let pr_expo = Promise::promise_if("Exporting", should_bc);
+
+    let expo = bex.map_err(|_| anyhow!("Failed to base64 encode TeX or send/receive TCP payload"))
+        .and_then(|t| {
+        let reqt = HTTPRequest::new(
+            HTTPMethod::POST,
+            URI::new_unchecked("https://www.overleaf.com:80/docs"),
+            1.1,
+            hash_map![],
+            format!("data:application/x-tex;base64,{}", t)
+        )?; // guaranteed valid
+
+            println!("{}", reqt.compile());
+
+            let reqt = HTTPRequest::new(
+                HTTPMethod::GET,
+                URI::new_unchecked("https://www.overleaf.com:80"),
+                1.1,
+                hash_map![],
+                String::new(),
+            )?;
+
+        let resp = http_request_expect(reqt, Duration::from_secs(HTTP_RW_TIMEOUT_SEC), Duration::from_secs(HTTP_RW_TIMEOUT_SEC), HTTP_RW_MAX_ATTEMPTS, HTTP_RW_MAX_ATTEMPTS, true)?;
+        URI::new(&FmtStr::only_fmt(OVERLEAF_URL, &resp.payload)?)
+    });
+
+    Promise::fulfill_if(pr_expo, true);
+    expo
 }
 
 // Note that statics are only declarable in .lhi and some add'l assumptions are made (strip spacing, immediately add all new, etc).
@@ -865,22 +1310,25 @@ pub fn scan_lhi(lhi: &File) {
 ///
 /// # Caveats
 /// Errs if decl is not able to be parsed (i.e. invalid format).
-fn decl2yaml(decl: &str) -> Result<Yaml, String> {
+fn decl2yaml(decl: &str) -> Result<Yaml, Error> {
     // decl format is "\newcommand{\$ID}{$MACRO}" or "\newcommand{\$ID}[$PC]{$MACRO}}"
-    let (re_valid, re_invalid) = (Regex::new(REGEX_DECL_VALID).unwrap(), Regex::new(REGEX_DECL_INVALID).unwrap());
-    let (caps_valid, caps_invalid) = (re_valid.captures(decl).unwrap(), re_invalid.captures(decl).unwrap());
+    let (re_valid, re_invalid) = (Regex::new(REGEX_DECL_VALID)?, Regex::new(REGEX_DECL_INVALID)?);
+    let (caps_valid, caps_invalid) = (re_valid.captures(decl)?, re_invalid.captures(decl)?);
 
     match (caps_valid, caps_invalid) {
+        // Valid decl
         (Some(caps), _) if caps.len() == 5 => { // <-- note that this is (1) full capture, (1) [$ID] opt group, (3) needed values.
             Ok(assemble_decl(&caps))
         },
 
+        // Invalid decl (content in right place but not right format)
         (Some(caps_v), Some(caps_i)) if caps_v.len() < caps_i.len() => {
-            Err(String::from("malformed decl!"))
+            Err(anyhow!("Cannot parse invalid decl to YAML"))
         },
 
+        // Malformed decl (content not in right places)
         _ => {
-            Err(String::new())
+            Err(anyhow!("Cannot parse malformed decl to YAML"))
         }
     }
 }
@@ -960,10 +1408,14 @@ fn assemble_decl(caps: &Captures) -> Yaml { // <-- I don't think this is designe
 /// Extracts named capture group from matching the given haystack, if present.
 fn regextract(re: &Regex, haystack: &str, name: &str) -> Option<String> {
     let caps = re.captures(haystack).unwrap();
-    caps.and_then(|c| Some(c[name].to_string()))
+    caps.and_then(|c| c.name(name).map(|m| m.as_str().to_string())) // <-- m is of type `Match<'_>`, not `&str`
 }
 
 /// Extracts the specified named capture groups from the given haystack, if present per-case.
+///
+/// # Caveats
+/// Note that returns `Err` if regex could not match, while returns `Some([None, None..])` if regex able to match but no captures.
+/// This is for avoiding requiring two matches if need to check for regex validity and actual captures (e.g. add'l `Regex::is_match`).
 fn regextract_n<const N: usize>(re: &Regex, haystack: &str, names: [&str; N]) -> [Option<String>; N]
 where [Option<String>; N]: Default {
     if let Some(caps) = re.captures(haystack).unwrap() {
@@ -1093,133 +1545,6 @@ pub fn segpend<R: RangeBounds<usize> + Clone + SliceIndex<str, Output=str>>(str:
     str.replace_range(seg, &append.fmt(&pati));     // <-- append mod to seg, put back
 }
 
-
-/// Chunks string from tail and returns segment and index when regex match is found.
-///
-/// # Caveats
-/// `re` must be a non-anchored single-match pattern, as chunk may have prefixed garbage chars.
-pub fn segtil(str: &str, re: &Regex, chunk_by: usize) -> (String, usize) {
-    todo!();
-}
-
-// pub fn invert_range<T: ?Sized>(range: &dyn RangeBounds<T>, len: usize) -> dyn RangeBounds<T> { <-- was thinking about libbing range inversion but seems a bit pedantic
-//
-// }
-
-/// Converts Markdown table to TeX, stripping formatting.
-/// # Examples
-/// This will convert:
-/// |  *sample*  | *type* |  *fish*  |
-/// | -------- | ---- | ------ |
-/// | $\alpha$ | 1    | trout  |
-/// | $\beta$  | S    | salmon |
-///
-/// into:
-///
-/// \begin{table}[]
-/// \begin{tabular}{|l|l|l|}
-/// \hline
-/// sample   & type & fish   \\ \hline
-/// $\alpha$ & 1    & trout  \\
-/// $\beta$  & S    & salmon \\ \hline
-/// \end{tabular}
-/// \end{table}
-///
-/// # Caveats
-/// While most Markdown tables should have precomputed spacing for visual clarity table2tex does not assume this.
-/// May be less performant but more broadly compatible.
-///
-/// All Markdown formatting (pretty much only * and **) will be clobbered; current implementation will blindly
-/// also remove any stray asterisks.
-///
-/// # Requires
-/// Markdown table must not contain any non-asterisk formatting (e.g. HTML tags)
-/// and must not be improperly sized (e.g. 3/3/2 table).
-
-// pub fn table2tex(md: &str) -> String {
-//     let mut tex = String::new();
-//
-//     let mut rows = md.lines().peekable();
-//     let row_len = rows.peek().unwrap().len();
-//
-//     // ▼  extract Split<'_> (collection) of cells arranged by row  ▼
-//     let row_cells = rows.map(|r| r
-//         .split("|")
-//         .filter(str::is_empty)
-//         .map(|cell| cell.trim().replace("*", "")));
-//
-//     // ▼  find max/padding lens for each column (of cells)  ▼
-//     row_cells.clone() // <-- "iter of rows of cells"
-//         .map(|row| row.max_by(|x,y| x.len().cmp(y.len())).unwrap()) // <-- "
-//
-//
-//
-//
-//
-//     tex.push_str("\\begin{table}[]\n");
-//     tex.push_str(&format!("\\begin{{tabular}}{{|{}}}\n", "l|".repeat(row_len)));
-//     tex.push_str("\\hline\n");
-//
-//
-//
-//
-//
-//
-//
-//     tex.push_str("\\end{tabular}\n");
-//     tex.push_str("\\end{table}\n");
-//
-//     tex
-// }
-
-/// Iterator adapter for 2D iter ("iter of iters") for row-column transposition.
-///
-/// [a d g]       [a b c]
-/// [b e h]  -->  [d e f]
-/// [c f i]       [g h i]
-///
-/// This means calling `transpose_iters` twice produces an idempotent 2D iter,
-/// meaning mutating column operations may be performed without breaking data format.
-///
-/// # Caveats
-/// Jagged/asymmetric 2D iters are not permitted for the sake of iter integrity; please see `transpose_iters_asymm`
-/// for a solution that returns Option<T> in lieu of T but works.
-// pub fn transpose_iters<I,J,T>(iters: I) -> I
-// where
-//     I: IntoIterator<Item=J>,
-//     J: IntoIterator<Item=T>,
-// {
-//
-// }
-
-/// Iterator adapter equivalent of `transpose_iters` but for jagged/asymmetric 2D iters.
-///
-/// [a d]          [a b c]
-/// [b]      -->   [d _ e]
-/// [c e f]        [_ _ f]
-///
-/// # Caveats
-/// The adapter must be called on pre-mapped optionals, please use `symmetrize_iters` to prepare.
-/// This is to support idempotency.
-// pub fn transpose_iters_asymm<I,J,T>(iters: I) -> I // <-- TODO impl generics getting out of hand!!
-// where
-//     I: IntoIterator<Item=J>,
-//     J: IntoIterator<Item=Option<T>>,
-// {
-//     unimplemented!();
-// }
-
-// Symmetrizes "iter-of-iters" or 2D iter by filling
-// pub fn symmetrize_iters<I,J,K,T>(iters: I) -> impl IntoIterator<Item=K>
-// where
-//     I: IntoIterator<Item=J>,
-//     J: IntoIterator<Item=T>,
-//     K: IntoIterator<Item=Option<T>>,
-// {
-//     unimplemented!();
-// }
-
-
 /// Directly adapted from "Writing SIMD Algorithm From Scratch" post.
 ///
 /// Creates a SIMD mask for all elements within the given inclusive range specified
@@ -1255,7 +1580,7 @@ where LaneCount<N>: SupportedLaneCount {
         let (mut padded_str, mut len) = (str.to_string(), str.len());
         let pad = ((len % 3) ^ 2 ^ 1) % 3;
 
-        padded_str.push_str(&String::from_utf8(vec![0x0, pad as u8])?); // 2 -> 1, 1 -> 2; 5 -> 2, 6 -> 1
+        padded_str.push_str(&String::from_utf8_unchecked(vec![0x0, pad as u8])); // 2 -> 1, 1 -> 2; 5 -> 2, 6 -> 1
         let mut ptr_u8: *mut u8 = padded_str.as_mut_ptr();
 
         len = ((len + pad) * 8) / 6; // <-- even with the 3B guarantee, still have to divide!
@@ -1432,12 +1757,6 @@ where LaneCount<N>: SupportedLaneCount {
     }
 }
 
-// /// Splits u8 into two halves, inspired by [Vec::split_at_mut](std::vec::Vec::split_at_mut).
-// #[inline(always)]
-// pub fn split_u8(num: u8, mid: u8) -> (u8, u8) {
-//
-// }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1455,6 +1774,15 @@ mod tests {
         assert_eq!(res16, expected);
         assert_eq!(res32, expected);
         assert_eq!(res64, expected);
+    }
+
+    #[test]
+    fn grc_uri() {
+        let u0 = URI::new("http://example.com");
+        let u1 = URI::new("https://www.overleaf.com/docs");
+
+        assert!(u0.is_ok());
+        assert!(u1.is_ok());
     }
 
     #[test]
