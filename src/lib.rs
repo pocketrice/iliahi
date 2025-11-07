@@ -1,4 +1,4 @@
-#![feature(portable_simd, vec_into_raw_parts, if_let_guard)]
+#![feature(portable_simd, vec_into_raw_parts, if_let_guard, pattern)]
 
 use anyhow::Error;
 use anyhow::{anyhow, bail};
@@ -8,19 +8,22 @@ use fancy_regex::{Captures, Regex};
 use map_macro::hash_map;
 use std::alloc::{alloc_zeroed, Layout};
 use std::collections::HashMap;
+use std::fs;
 use std::fs::{File, OpenOptions};
 use std::io::{stdin, stdout, BufRead, BufReader, Read, Write};
 use std::iter::Peekable;
 use std::net::TcpStream;
 use std::ops::RangeBounds;
+use std::path::Path;
 use std::process::{Command, Stdio};
+use std::ptr;
 use std::simd::prelude::{SimdInt, SimdPartialOrd};
 use std::simd::{LaneCount, Mask, Simd, SupportedLaneCount};
 use std::slice::SliceIndex;
+use std::str::pattern::Pattern;
 use std::str::FromStr;
 use std::string::FromUtf8Error;
 use std::time::{Duration, Instant};
-use std::{fs, ptr};
 use yaml_rust::{yaml, Yaml, YamlEmitter, YamlLoader};
 
 type TeXContent = String;
@@ -28,40 +31,51 @@ type Fmtr<'a> = &'a str;
 
 
 // changelog
-// 0.1.x ... supports basic features (no preproc/db)
+// 0.1.x ... supports basic features (no content/db)
 // 0.2.x ... decls rewrite to use db
 // 0.3.x ... statics support to db, .lhi files
 // 0.4.x ... preprocessor experimentation, migration to nightly
 // 0.5.x ... preprocessor support, hyperoptim base64
 // 0.6.x ... simple URL validation, export to overleaf finished
 // 1.0.0 ... adapted from overleaf to pdflatex conversion
+// 1.1.0 ... &CONDENSE (seg-local content) added, finalans/partans content
+// 2.0.0 ... adapted from 'raw' to clap CLI usage, pdflatex binding
 
-static VERSION_NUM: &str = "1.0.0";
+static USER_AGENT: &str = "iliahi TeX proxy";
+static VERSION_NUM: &str = "2.0.0";
 static VERSION_BRANCH: &str = "ALPHA";
 
 
 static FMT_ANCHOR: &str = "{}";
 static SEG_SENTINEL: &str = "*(S)*";
 static REGEX_META_NCAP: &str = r".*\(\?P<(?P<ncap>.+)>.*\).*"; // <-- note, this means only limited to one named capture group for regmerge!
-static REGEX_SEG_D1: &str = r"\*\*(?P<eid>.+)\.\*\*";
-static REGEX_SEG_D2: &str = r"\*\((?P<eid>.+)\)\*";
-static REGEX_SEG_ANY: &str = r"^((\*)|(\*\*))(?(2)\(|)(?P<eid>[a-zA-Z0-9]+)(?(2)\)\*|\.\*\*)$"; // <-- requires use of fancy-regex;
-static REGEX_DECL_VALID: &str = r"\\newcommand\{\\(?P<id>[a-z]+)}(\[(?P<pc>\d+)])?\{(?P<macro>.*)}";
-static REGEX_DECL_INVALID: &str = r"\\newcommand\{\\(?P<id>.+)}(\[(?P<pc>.+)])?\{(?P<macro>.*)}";
-static REGEX_DECL_ID: &str = r"\\newcommand\{\\(?P<id>[a-z]+)}(\[\d+])?\{.*}";
-static REGEX_USES_FINAL: &str = r".*(\\finalans\{.+\}).*";
+static REGEX_SEG_D1: &str = r"^\*\*(?P<eid>.+)\.\*\*( %.+%)?$";
+static REGEX_SEG_D2: &str = r"^\*\((?P<eid>.+)\)\*( %.+%)?$";
+static REGEX_SEG_ANY: &str = r"^((\*)|(\*\*))(?(2)\(|)(?P<eid>[a-zA-Z0-9]+)(?(2)\)\*|\.\*\*)( %.+%)?$"; // <-- requires use of fancy-regex;
+static REGEX_DECL_VALID: &str = r"\\(renew|new|provide)command\{\\(?P<id>[a-z]+)}(\[(?P<pc>\d+)])?\{(?P<macro>.*)}";
+static REGEX_DECL_INVALID: &str = r"\\(renew|new|provide)command\{\\(?P<id>.+)}(\[(?P<pc>.+)])?\{(?P<macro>.*)}";
+static REGEX_DECL_ID: &str = r"\\(renew|new|provide)command\{\\(?P<id>[a-z]+)}(\[\d+])?\{.*}";
+static REGEX_USES_FINAL: &str = r".*?((\\finalans\{.+\})|(##.+##)).*?";
 static REGEX_USES_QQ: &str = r"((\\(q+|[;,>:]|(hspace)))*)(?<nq>.+)";
 static REGEX_COMMS: &str = "%{2}.*?%{2}";
 static REGEX_PREPROC_DEFINE: &str = r"^&DEFINE *\( *(?<ident>.+?) *, *(?<value>.*? *)\)$";
 static REGEX_PREPROC_INCLUDE: &str = r"^&INCLUDE *\( *(?<ident>.+?)\.lhi *\)$";
+static REGEX_PREPROC_CONDENSE: &str = r"^&CONDENSE *\( *(?<seg>[a-zA-Z0-9]+?) *(, *(?<subseg>[a-zA-Z0-9]+?))? *\)$";
 static REGEX_URI: &str = r"(?<scheme>[a-zA-Z][a-zA-Z0-9+\-.]*):(?<authority>\/\/(?<host>([a-zA-Z0-9]+\.)*[a-zA-Z0-9]+)(:(?<port>[0-9]+))?)?(\/(?<path>([A-Za-z0-9:@!$&'()*+,;=]+)*))(\?(?<query>[0-9A-Za-z:@!$&'()*+,;=\-._~\/]+))?(\#(?<fragment>[0-9A-Za-z:@!$&'()*+,;=\-._~\/]+))?";
 /// note this is a workaround for retrieving URI authority `dyn Identifier` replacing `URI`. This assumes the URI is already valid and is absolute (of type `URI`).
-static REGEX_URI_AUTH: &str = r".*\/\/(?<authority>([a-zA-Z0-9]+\.)*[a-zA-Z0-9]+(:[0-9]+)?).*";
+static REGEX_REQT_AUTH: &str = r".*(Host: (?<authority>([a-zA-Z0-9]+\.)*[a-zA-Z0-9]+(:[0-9]+)?).*)";
 static REGEX_REL_URI: &str = r"\/(?<path>([A-Za-z0-9:@!$&'()*+,;=]+)*)(\?(?<query>[0-9A-Za-z:@!$&'()*+,;=\-._~\/]+))?(\#(?<fragment>[0-9A-Za-z:@!$&'()*+,;=\-._~\/]+))?";
-static REGEX_HTTP_HEADER: &str = r"^[A-Z][a-z]+(-[A-Z][a-z]+)*$";
+static REGEX_HTTP_HEADER: &str = r"^[A-Za-z]+[A-Za-z-]*";
+static REGEX_SEGDIRS: &str = r".*(?<sdc>%(?<segdirs>[a-zA-Z]*){}%)"; // <-- `sdc` encapsulates entire segdirs chunk (with ornaments), `segdirs` is purely the eponymous
+static RERPL_PREPROC_FINALANS: &str = r"(?<left>.*)##(?<mid>.+)##(?<right>.*)"; // <-- "RERPL" denotes a regex replacer, it won't normally match the intended content (e.g. getting just the finalans part) as they're more or less scoped and inverted
+static RERPL_PREPROC_PARTANS: &str = r"(?<left>.*)@@(?<mid>.+)@@(?<right>.*)";
 static HTTP_VERSIONS: [f32; 5] = [0.9, 1.0, 1.1, 2.0, 3.0];
-static HTTP_RW_TIMEOUT_SEC: u64 = 5;
+static HTTP_RW_TIMEOUT_SEC: u64 = 10;
+static HTTP_RW_WAIT_MS: u64 = 5000;
 static HTTP_RW_MAX_ATTEMPTS: usize = 3;
+static HTTP_POST_BOUNDARY: &str = "S314mat-------p4g1!";
+static HTTP_POST_NO_FILENAME: &str = "file";
+static HTTP_PAYLOAD_MAX_SIZE: usize = 32768; // 32Kib
 
 // static REGEX_QQ: &str = r"(\\(q+|[;,>:]|(hspace)))";
 
@@ -76,13 +90,16 @@ static PATH_DB: &str = "db.yaml";
 static PATH_TEMPLATE: &str = "template.tex";
 static NO_MATCH: &str = "";
 static LINE_BREAK: &str = "<hr>";
+static SEG_D1: Fmtr = r"**{}.**";
+static SEG_D2: Fmtr = r"*({})*";
+static SEGDIR_FMT: Fmtr = r"%{}%";
 static FINAL_FMT: Fmtr = r"\finalans{{}}";
 static PROMISE_FMT: Fmtr = "{}... ";
 static PROMISE_OK: &str = "OK";
 static PROMISE_NG: &str = "NG";
 static PROMISE_DEF_PRECISION: usize = 3;
-static OVERLEAF_URL: Fmtr = "https://www.overleaf.com/docs?snip_uri[]=data:application/x-tex;base64,{}";
-static BASE64_VECTOR_SIZE: usize = 64; // <-- 2024 standard is AVX-512 (512b) or SVE2 (128-1024b in 128b incr); using Assigments 1-9 avg=4620c, stdev=2085c. Using 1024b/128B would be most optimal but seems like 512b/64B is safer.
+static OVERLEAF_URL: Fmtr = "https://www.overleaf.com/docs?snip_uri={}";
+static BASE64_VECTOR_SIZE: usize = 32; // <-- 2024 standard is AVX2 (256b) or SVE2 (128-1024b in 128b incr); using Assignments 1-9 avg=4620c, stdev=2085c. Using 1024b/128B would be most optimal but seems like 256b/32B is safer.
 //static BASE64_VECTOR_OFFS: [i8; 5] = [b'A' as i8, (b'a' - 26) as i8, (52 - b'0') as i8, (62 - b'+') as i8, (63 - b'/') as i8]; // <-- add these to 6-bit value to receive the base64 representation!
 
 // raws         maps      ascii
@@ -133,9 +150,24 @@ pub struct URI {
     fragment: Option<String> // ... #History
 }
 impl URI {
+    /// Parses given URI.
+    ///
+    /// # Caveats
+    /// For convenience appends `https://` if scheme missing.
+    /// Note that path must be explicitly specified (even if empty) else will get a "valid" URI but parsed incorrectly. This is known
+    /// behavior and will be fixed (soon).
+    ///
+    /// e.g. `https://mincci.no` vs. `https://mincci.no/`
     pub fn new(uri: &str) -> Result<URI, Error> {
         let re_uri = Regex::new(REGEX_URI)?;
-        let [scheme, host, port, path, query, fragment] = regextract_n(&re_uri, uri, ["scheme", "host", "port", "path", "query", "fragment"]);
+
+        let uri = if uri.contains("://") {
+            uri.to_string()
+        } else {
+            format!("https://{}", uri)
+        };
+
+        let [scheme, host, port, path, query, fragment] = regextract_n(&re_uri, &uri, ["scheme", "host", "port", "path", "query", "fragment"]);
 
         if scheme.is_some() && path.is_some() { // note that no other checks needed, if they are malformed and bleed into another section it would not cause this destructuring to "miss" it since it's now in that other section.
             Ok(URI {
@@ -228,7 +260,7 @@ impl Identifier for RelativeURI {
     /// Resolves the relative URI against an absolute anchor URI. Absolute fragment and query are replaced.
     fn resolve(&self, auri: Option<URI>) -> Result<String, Error> {
         match auri {
-            Some(mut a) => { // manual format to avoid moves
+            Some(a) => { // manual format to avoid moves
                 let auth = a.authority().unwrap_or(String::new());
                 let ruri = self.compile();
 
@@ -265,19 +297,64 @@ impl Identifier for RelativeURI {
     }
 }
 
+/// Representation of a segment processing directive containing
+/// a basic constructive behavior applied line-wise for a segment.
+///
+/// Note that this is not a segment content directive, instead it overrides standard
+/// segment compilation behavior. Hence no `process` method is provided as the
+/// segment compiler should manage what to do with these directives.
+#[derive(PartialEq)]
+pub enum SegmentDirective {
+    Condense,                        // keeps segment condensed (no line end spacing)
+}
+
+impl SegmentDirective {
+    /// Creates new instance from char representation. Case-insensitive.
+    ///
+    /// # Caveats
+    /// If you are looking to extract and dissect a segdirs chunk within a string, please use [`SegmentDirective::extract`] instead.
+    pub fn from(directive: char) -> Result<SegmentDirective, Error> {
+        match directive {
+            'C' | 'c' => Ok(SegmentDirective::Condense),
+            _ => Err(anyhow!("Invalid or nonexistent segment directive"))
+        }
+    }
+
+    /// Extracts (and dissects) segment directive chunk encoded within a string.
+    /// Note that calling this on a string without a segdir chunk is defined behavior, and that `line` will be stripped of its segdir chunk.
+    ///
+    /// # Caveats
+    /// Non-segdir chunk part of `line` must not contain %.
+    pub fn extract(line: &mut String) -> Vec<SegmentDirective> {
+        let re_segdirs = Regex::new(REGEX_SEGDIRS).unwrap();
+
+        let matches = regextract_n(&re_segdirs, line, ["sdc", "segdirs"]);
+
+        if let [Some(sdc), Some(sds)] = matches { // note that existence of `sds` (segdirs) guarantees `sdc` (segdir chunk) and vice versa
+            let mut segdirs = Vec::<SegmentDirective>::with_capacity(sds.len()); // prefer over allocating at init to eliminate vec realloc
+            *line = line.replace(&sdc, "");
+            segdirs.splice(0..0, sds.as_str().chars().map(SegmentDirective::from).filter_map(|sd| sd.ok()).collect::<Vec<_>>());
+
+            segdirs
+        } else {
+            vec![]
+        }
+    }
+}
+
 /// Representation of a preprocessor directive containing a basic
 /// constructive behavior applied either globally or locally.
 ///
-/// The use of `PreprocessorDirective`s produces a standard .pli preprocessed file.
+/// The use of `PreprocessorDirective`s produces a standard .lho preprocessed file.
 pub enum PreprocessorDirective {
-    TrimComms,               // Remove all Markdown (%%...%%) comments.
-    MarkFinal,               // Marks the last lines of each segment as final (if no final is present).
-    Define(String, String),  // Replaces the placeholder string (left) with its value.
-    Include(String),         // Inlines the contents of .lhi file to top of content. <-- purposefully doesn't abide by IgnoreDecls if you want to selectively append and remove things :)
-    IgnoreDecls,             // Ignores all in-line decls in the file. <-- note, this may seem useless but if you're just using default decl lib then this saves parsing decls!
-    EnforceSpacing,          // Spaces each line forcibly even if not originally present.
-    FlatSegs,                // Converts all subsegments, resulting in 1-deep segments.
-
+    TrimComms,                        // Remove all Markdown (%%...%%) comments.
+    Finalize,                        // Marks the last lines of each segment as final (if no final is present).
+    Define(String, String),           // Replaces the placeholder string (left) with its value.
+    Include(String),                  // Inlines the contents of .lhi file to top of content. <-- purposefully doesn't abide by IgnoreDecls if you want to selectively append and remove things :)
+    IgnoreDecls,                      // Ignores all in-line decls in the file. <-- note, this may seem useless but if you're just using default decl lib then this saves parsing decls!
+    EnforceSpacing,                   // Spaces each line forcibly even if not originally present.
+    FlatSegs,                         // Converts all subsegments, resulting in 1-deep segments.
+    Condense(String, Option<String>), // Reformats the target (sub)segment for condensed output on single-line lists. Max 2 layers deep.
 }
 
 impl PreprocessorDirective {
@@ -287,17 +364,18 @@ impl PreprocessorDirective {
     /// Note that `directive` will be in the form of "(.*)"; note
     /// stripped newline but presence of & identifier.
     pub fn from(directive: &str) -> Result<PreprocessorDirective, Error> {
-        let (re_def, re_incl) = (Regex::new(REGEX_PREPROC_DEFINE)?, Regex::new(REGEX_PREPROC_INCLUDE)?);
+        let (re_def, re_incl, re_cnds) = (Regex::new(REGEX_PREPROC_DEFINE)?, Regex::new(REGEX_PREPROC_INCLUDE)?, Regex::new(REGEX_PREPROC_CONDENSE)?);
 
         match directive {
-            "&TRIM_COMM" => Ok(PreprocessorDirective::TrimComms),
-            "&IGNORE_DECLS" => Ok(PreprocessorDirective::IgnoreDecls),
-            "&FINALIZE" => Ok(PreprocessorDirective::MarkFinal),
-            "&ENFORCE_SPACING" => Ok(PreprocessorDirective::EnforceSpacing),
-            "&FLATTEN" => Ok(PreprocessorDirective::FlatSegs),
+            "&TRIM_COMM" | "&TRIM_COMMS" | "&TRIMCOMM" | "&TRIMCOMMS" => Ok(PreprocessorDirective::TrimComms),
+            "&IGNORE_DECLS" | "&IGNORE_DECL" | "&IGNOREDECLS" | "&IGNOREDECL" => Ok(PreprocessorDirective::IgnoreDecls),
+            "&FINALIZE" | "&FINALISE" | "&MARKFINAL" | "&MARK_FINAL" => Ok(PreprocessorDirective::Finalize),
+            "&ENFORCE_SPACING" | "&ENFORCE" | "&ENFORCESPACING" => Ok(PreprocessorDirective::EnforceSpacing),
+            "&FLATTEN" | "&FLAT" => Ok(PreprocessorDirective::FlatSegs),
             d if let [Some(ident), Some(value)] = regextract_n(&re_def, d, ["ident", "value"]) => Ok(PreprocessorDirective::Define(ident, value)),
             d if let Some(ident) = regextract(&re_incl, d, "ident") => Ok(PreprocessorDirective::Include(ident)), // <-- you could technically throw a fit here for nonexistant lib, but better to save until parse-time anyway. Plus, the mere existence of a directive does not constitute validity.
-            _ => Err(anyhow!("Invalid or nonexistent directive")),
+            d if let [Some(seg), subseg] = regextract_n(&re_cnds, d, ["seg", "subseg"]) => Ok(PreprocessorDirective::Condense(seg, subseg)),
+            _ => Err(anyhow!("Invalid or nonexistent content directive")),
         }
     }
 
@@ -310,8 +388,15 @@ impl PreprocessorDirective {
     ///
     /// This does mean that no relative operations/optimizations are possible
     /// (e.g. `PreprocessorDirective::IgnoreDecls` using decls locality to shortcut).
+    ///
+    /// If `PreprocessorDirective::Condense` is present in `directives`, it should be placed prior to `PreprocessorDirective::MarkFinal`
+    /// or condensed segments may not be finalized properly (if not already finalized by user).
+    ///
+    /// Any non-directive preprocessing (e.g. required macro fills) will not be performed here, and should instead be delegated to `$PARSER::preprocess`.
+    /// This function assumes such preprocessing is already performed.
     pub fn preprocess(directives: &Vec<PreprocessorDirective>, content: &mut Vec<String>) {
-        let (dirs_global, dirs_local): (Vec<_>, Vec<_>) = directives.iter().partition(|&d| matches!(d, PreprocessorDirective::Include(_) | PreprocessorDirective::MarkFinal | PreprocessorDirective::IgnoreDecls));
+        let (dirs_global, dirs_local): (Vec<_>, Vec<_>) = directives.iter().partition(|&d| matches!(d, PreprocessorDirective::Include(_) | PreprocessorDirective::Finalize | PreprocessorDirective::IgnoreDecls | PreprocessorDirective::Condense(_,_)));
+        let (re_seg_d1, re_seg_d2) = (Regex::new(REGEX_SEG_D1).unwrap(), Regex::new(REGEX_SEG_D2).unwrap());
 
         for dir in dirs_global {
             match dir {
@@ -324,7 +409,7 @@ impl PreprocessorDirective {
                     // content.push(decls);
                     // content.rotate_right(decls_len); // <-- pushing to tail of vec then single memory realloc feels more performant than individually shifting all contents one-by-one...
                 },
-                PreprocessorDirective::MarkFinal => {
+                PreprocessorDirective::Finalize => {
                     let (re_qq, re_final, re_seg) = (Regex::new(REGEX_USES_QQ).unwrap(), Regex::new(REGEX_USES_FINAL).unwrap(), Regex::new(REGEX_SEG_ANY).unwrap());
                     let fmst = FmtStr::from(FINAL_FMT).unwrap();
 
@@ -358,10 +443,10 @@ impl PreprocessorDirective {
                     content.push(String::from(SEG_SENTINEL));
 
                     let mut seg_needs_final = true;
-                    for i in 1..(content.len()-2) {
+                    for i in 1..(content.len() - 2) {
                         // SAFETY: entering for loop = guaranteed chunk size of 3, indices never overlap.
                         // `peek` is borrowed as mut even though it doesn't need to since (a) convinces bchk and (b) prolly saves time as it's 1 access vs. 2.
-                        let [pre, curr, peek] = unsafe { content.get_disjoint_unchecked_mut([i-1, i, i+1]) };
+                        let [pre, curr, peek] = unsafe { content.get_disjoint_unchecked_mut([i - 1, i, i + 1]) };
 
                         if re_final.is_match(curr).unwrap() { seg_needs_final = false; }
 
@@ -382,18 +467,46 @@ impl PreprocessorDirective {
                     content.pop();
                 },
                 PreprocessorDirective::IgnoreDecls => { //                          <-- although this may technically be "local" rather "global", if decl notation changes and must be inspected relatively this helps.
-                    let re_declv = Regex::new(REGEX_DECL_VALID).unwrap();//      additionally, as this is simply a remove operation I feel a simple `retain` may be more performant
-                    content.retain(|l| re_declv.is_match(l).unwrap());
+                    let re_declv = Regex::new(REGEX_DECL_VALID).unwrap(); //      additionally, as this is simply a remove operation I feel a simple `retain` may be more performant
+                    content.retain(|l| !re_declv.is_match(l).unwrap());
+                },
+                PreprocessorDirective::Condense(seg, subseg) => {
+                    let (con_init, mut con_ptr, mut con_buf) = (content[..].iter_mut(), 0usize, Vec::<String>::new()); // following this, will begin at the target (sub)segment. prefer over content[..].iter_mut() or splice() as cannot insert and iter easily respectively
+                    let re_segdirs = Regex::new(REGEX_SEGDIRS).unwrap();
+
+                    //    ▼ end delim regex    ▼ start delim regex
+                    let (delim_end, delim_init) = if let Some(ss) = subseg { // condense a subseg of a seg (may include subsegs of subseg))
+                        (&re_seg_d2, FmtStr::only_fmt(SEG_D2, ss).unwrap())
+                    } else { // condense entire seg
+                        (&re_seg_d1, FmtStr::only_fmt(SEG_D1, seg).unwrap())
+                    }; // <-- both fmstr & regex should always be valid
+
+                    let mut con_init = con_init.skip_while(|c| { con_ptr += 1; delim_init != **c } ).skip(1); // note! side effect is increment con_ptr. skips the initial label.
+
+                    while let Some(l) = con_init.next() && !delim_end.is_match(l).unwrap() { // <-- this covers all lines to be modified (within the desired (sub)seg). for actually splitting subseg label a blind space check is used.
+                        if !l.is_empty() { // skip empty lines. This is especially relevant for the ever-poignant space right before next seglabel that messes this up lol
+                            let [mut label, tex] = {
+                                let (split, _) = str_splitn_fixed::<_, 2>(l, ' '); // per https://stackoverflow.com/questions/41517187/split-string-only-once-in-rust
+                                split.map(str::to_string)
+                            };
+
+                            if !re_segdirs.is_match(&label).unwrap() { // !label.contains(&re_segdirs) { add segdirs section if not present
+                                label.push_str(r" %{}%");
+                            }
+                            con_buf.push(FmtStr::only_fmt(&label, &"C{}").unwrap()); // <-- a special "seg directive" that &TRIM_COMM ignores. note how you must continue the {} chain to permit future segdirs. This is parsed and stripped by `Segment::compile`.
+                            con_buf.push(tex.to_string());
+                        }
+                    }
+                    content.splice(con_ptr..(con_ptr + con_buf.len() / 2), con_buf); // <-- this should replace all of those segment (buf.len / 2) and insert the extra other half too! per https://stackoverflow.com/questions/28678615/efficiently-insert-or-replace-multiple-elements-in-the-middle-or-at-the-beginnin
                 },
                 _ => unreachable!()
             }
         }
 
-        let re_seg_d2 = Regex::new(REGEX_SEG_D2).unwrap();
         for line in content {
             for dir in &dirs_local {
                 match *dir {
-                    PreprocessorDirective::TrimComms => {
+                    PreprocessorDirective::TrimComms => { // <-- take note, any segdirs must NOT use %%...%%! for example, current SEGDIR_FMT is simply %...%!
                         let re_comms = Regex::new(REGEX_COMMS).unwrap();
                         *line = re_comms.replace_all(line, "").into_owned();
                     },
@@ -422,12 +535,18 @@ impl PreprocessorDirective {
     pub fn convert(&self) -> String {
         match &self {
             PreprocessorDirective::TrimComms => String::from("&TRIM_COMM"),
-            PreprocessorDirective::MarkFinal => String::from("&FINALIZE"),
+            PreprocessorDirective::Finalize => String::from("&FINALIZE"),
             PreprocessorDirective::EnforceSpacing => String::from("&ENFORCE_SPACING"),
             PreprocessorDirective::FlatSegs => String::from("&FLATTEN"),
             PreprocessorDirective::IgnoreDecls => String::from("&IGNORE_DECL"),
             PreprocessorDirective::Define(ident, value) => format!("&DEFINE({}, {})", ident, value),
             PreprocessorDirective::Include(ident) => format!("&INCLUDE({})", ident),
+            PreprocessorDirective::Condense(seg, subseg) => {
+                match subseg {
+                    Some(ss) => format!("&CONDENSE({}, {})", seg, ss),
+                    None => format!("&CONDENSE({})", seg)
+                }
+            }
         }
     }
 }
@@ -461,11 +580,11 @@ impl Promise {
     /// Fulfills the promise and outputs based on pass condition, thus closing it.
     pub fn fulfill(self, pass: bool) { // <-- more behavior can go here if needed (don't touch Drop; may want to allow a cleanup function etc etc.)
         let msg = if pass { PROMISE_OK } else { PROMISE_NG };
-        println!("{} ({:.3}ms)", msg, self.ts.and_then(|t| Some(t.elapsed().as_micros() as f32 / 1000.0)).unwrap_or(0.0));
+        println!("{} ({:.2}ms)", msg, self.ts.and_then(|t| Some(t.elapsed().as_micros() as f32 / 1000.0)).unwrap_or(0.0));
     }
 
-    /// Performs and returns [Promise::only_wish] if condition is met, otherwise None.
-    /// This is handy for concise conditional promising using a global like `should_bc` in conjunction with [Promise::fulfill_if].
+    /// Performs and returns [`Promise::only_wish`] if condition is met, otherwise None.
+    /// This is handy for concise conditional promising using a global like `should_bc` in conjunction with [`Promise::fulfill_if`].
     pub fn promise_if(ident: &str, cond: bool) -> Option<Promise> {
         match cond {
             true => Some(Promise::only_wish(ident)),
@@ -491,7 +610,7 @@ impl Promise {
 // }
 
 #[derive(Debug)]
-enum HTTPMethod {
+pub enum HTTPMethod {
     GET,
     HEAD,
     POST,
@@ -526,20 +645,25 @@ pub struct HTTPRequest {
     http_ver: f32, // relative-indexed versioning (HTTP/0.9, /1.0, /1.1, /2, /3)
     headers: HashMap<String, String>, // avoid `Header` enum, as custom "X-header" is possible!
     payload: String, // prefer string over raw bytes; (a) transfer is string anyway and (b) HTTP/1.x is plaintext while HTTP/2 is binary
-
 }
 
 impl HTTPRequest {
+    /// Assembles a new HTTP request.
+    ///
+    /// # Caveats
+    /// If payload size exceeds [`HTTP_PAYLOAD_MAX_SIZE`] bytes, an error will be forcibly thrown as a safeguard against
+    /// overloading recipient servers.
     pub fn new(method: HTTPMethod, uri: URI, http_ver: f32, headers: HashMap<&str, &str>, payload: String) -> Result<Self, Error> {
-        let re_http_header = Regex::new(REGEX_HTTP_HEADER)?;
+        if payload.len() > HTTP_PAYLOAD_MAX_SIZE { return Err(anyhow!("Request payload is too large")); }
 
+        let re_http_header = Regex::new(REGEX_HTTP_HEADER)?;
         let mut headers: HashMap<String, String> = headers.iter().map(|(name, field)| (name.to_string(), field.to_string())).collect(); // convert &str map to String map; prior is for front-facing convenience
 
         if headers.keys().all(|name| re_http_header.is_match(name).unwrap()) && HTTP_VERSIONS.contains(&http_ver) {
             Ok(match method {
                 HTTPMethod::POST => {
                     let (ruri, auri) = RelativeURI::extract(uri);
-                    headers.insert(String::from("Host"), auri.compile());
+                    headers.insert(String::from("Host"), auri.authority().unwrap()); // For "Host", the scheme is implied and actually must not be existent
                     HTTPRequest { method, uri: Box::new(ruri), http_ver, headers, payload }
                 },
                 _ => HTTPRequest { method, uri: Box::new(uri), http_ver, headers, payload }
@@ -549,15 +673,20 @@ impl HTTPRequest {
         }
     }
 
+    /// Parses and assembles a HTTP request from plaintext form.
+    ///
+    /// # Caveats
+    /// If payload size exceeds [`HTTP_PAYLOAD_MAX_SIZE`] bytes, an error will be forcibly thrown as a safeguard against
+    /// overloading recipient servers.
     pub fn from(reqt: &str) -> Result<Self, Error> {
         let re_http_header = Regex::new(REGEX_HTTP_HEADER)?;
 
         let mut lines = reqt.lines()
-            .filter(|l| !l.is_empty())
             .map(|l| l.trim());
 
         let (method, uri, http_ver) = {
-            if let Some(line) = lines.next() && let [m, u, v, ..] = line.split(' ').collect::<Vec<&str>>()[..] {
+            if let Some(line) = lines.next() {
+                let ([m, u, v], _) = str_splitn_fixed::<_, 3>(line, ' ');
                 let nm = HTTPMethod::new(m)?;
                 let nu: Box<dyn Identifier> = match nm {
                     HTTPMethod::POST => Box::new(RelativeURI::new(u)?),
@@ -588,13 +717,150 @@ impl HTTPRequest {
         Ok(HTTPRequest { method, uri, http_ver, headers, payload })
     }
 
+    /// Fill common HTTP headers for a generic single-time request.
+    pub fn hfill(&mut self) {
+        self.hput("Connection", "close").unwrap(); // per https://stackoverflow.com/a/67038784/30291565, this is why prior requests were stalling for ~60s!
+        self.hput("Accept-Encoding", "br, deflate, gzip, x-gzip").unwrap();
+        self.hput("Accept", "*/*").unwrap();
+    }
+
+    /// Insert given HTTP header if not existent.
+    ///
+    /// # Caveats
+    /// Errs if header name is not valid.
+    pub fn hput(&mut self, name: &str, field: &str) -> Result<(), Error>{
+        let re_http_header = Regex::new(REGEX_HTTP_HEADER)?;
+
+        if re_http_header.is_match(name)? {
+            let (name, field) = (name.to_string(), field.to_string());
+            self.headers.entry(name).or_insert(field);
+
+            Ok(())
+        } else {
+            Err(anyhow!("Invalid HTTP header name"))
+        }
+    }
+
+    /// Insert given HTTP header, overwriting if existent.
+    pub fn hpush(&mut self, name: &str, field: &str) -> Result<Option<String>, Error> {
+        let re_http_header = Regex::new(REGEX_HTTP_HEADER)?;
+
+        if re_http_header.is_match(name)? {
+            let (name, field) = (name.to_string(), field.to_string());
+            Ok(self.headers.insert(name, field))
+        } else {
+            Err(anyhow!("Invalid HTTP header name"))
+        }
+    }
+
+    /// Compiles HTTP request into plaintext form valid for sending, such as via TCP.
     pub fn compile(self) -> String {
-        format!("{:?} {:?} HTTP/{}\n{}\n{}",
+        format!("{:?} {} HTTP/{}\n{}\n\n{}",
                 self.method, self.uri.compile(), self.http_ver, // <-- note! prior `self.uri.resolve(auri)` was throwing "cannot move a value of type 'dyn Identifier'; per https://stackoverflow.com/a/76038535/30291565 trait objects must act only on &self not self
                 self.headers.iter().map(|(name, field)| format!("{}: {}", name, field)).collect::<Vec<_>>().join("\n"),
                 self.payload)
     }
+
+    /// Sends the compiled HTTP request via [`TcpStream`] to the recipient server specified by the URI and awaits a response with retries and timeouts.
+    /// `should_bc` sets if status info is written to stdout.
+    ///
+    /// # Caveats
+    /// For respecting recipient servers, some headers (`User-Agent`, `content-length`) are forcibly overwritten.
+    pub fn send(mut self, r_timeout: Duration, w_timeout: Duration, should_bc: bool) -> Result<HTTPResponse, Error> {
+        self.hpush("User-Agent", &format!("{}/{}", USER_AGENT, VERSION_NUM))?; // compliant per RFC 2068 14.42, https://stackoverflow.com/questions/16391842/setting-user-agent-correctly-for-a-command-line-app
+        self.hpush("Content-Length", &self.payload.as_bytes().len().to_string())?;
+
+        let (reqt, mut resp) = (self.compile(), String::new());
+        let auth_cand = regextract(&Regex::new(REGEX_REQT_AUTH).unwrap(), &reqt, "authority");
+
+        if let Some(auth) = auth_cand {
+            || -> Result<HTTPResponse, Error> { // "try-catch" behavior adapted https://stackoverflow.com/a/55756926/30291565
+                let pr_con = Promise::promise_if("\n▶ Connecting", should_bc);
+
+                let mut stream = TcpStream::connect(format!("{}:80", auth))?;
+                stream.set_read_timeout(Some(r_timeout))?;
+                stream.set_write_timeout(Some(w_timeout))?;
+
+                Promise::fulfill_if(pr_con, true);
+
+
+
+                let pr_write = Promise::promise_if("▶ Writing", should_bc);
+
+                stream.write_all(reqt.as_bytes())?;
+                stream.flush();
+
+                Promise::fulfill_if(pr_write, true);
+
+                let pr_read = Promise::promise_if("▶ Reading", should_bc);
+
+                let mut num_reads = 1usize;
+                std::thread::sleep(Duration::from_millis(HTTP_RW_WAIT_MS));
+
+                while resp.is_empty() {
+                    stream.read_to_string(&mut resp)?;
+
+                    num_reads += 1;
+                    if num_reads > HTTP_RW_MAX_ATTEMPTS { return Err(anyhow!("Exceeded max read attempts")) }
+                }
+                Promise::fulfill_if(pr_read, true);
+
+                HTTPResponse::from(&resp)
+            }()
+        } else {
+            Err(anyhow!("HTTP request failed or timed out"))
+        }
+    }
+
+    /// Assembles a `multipart/form-data` HTTP/1.1 POST request for plaintext or binary file.
+    /// Optional filename parameter if desired.
+    ///
+    /// # Caveats
+    /// In a significant majority of cases the use of `HTTP_POST_BOUNDARY` should already be sufficient; however
+    /// if present a manual appendage process is used. If the payload contains the boundary template and many of the
+    /// appendage character this method may stall.
+    ///
+    /// If no filename is given, the method assumes a placeholder extensionless file name that the server may or may not accept.
+    ///
+    /// The actual file is denoted using `name="file"; filename="$NAME"` which the server may or may not accept.
+    ///
+    /// Per MDN, any nonalphanumeric chars will be percent-encoded so prefer `Left<&Path>` for binary files.
+    pub fn multipost(payload: Either<&str, &Path>, uri: URI, name: Option<&str>, fields: HashMap<&str, &str>) -> Result<Self, Error> {
+        let boundary = match payload {
+            Left(text) => {
+                let mut cand = String::with_capacity(HTTP_POST_BOUNDARY.len() + 3);
+                cand.push_str(&HTTP_POST_BOUNDARY);
+
+                while text.contains(&cand) {
+                    cand.push('=');
+                }
+                cand
+            },
+            Right(_) => String::from(HTTP_POST_BOUNDARY)
+        };
+
+        let body = {
+            let mut data = fields.iter()
+                .map(|(k, v)| format!("--{}\nContent-Disposition: form-data; name=\"{}\"\n\n{}", boundary, k, v))
+                .collect::<Vec<_>>();
+
+            data.push(match payload {
+                Left(text) =>
+                    format!("--{}\nContent-Disposition: form-data; name=\"file\"; filename=\"{}\"\nContent-Type: text/plain\n\n{}", boundary, name.unwrap_or(HTTP_POST_NO_FILENAME), text),
+                Right(path) => {
+                    let data = fs::read(path)?;
+                    format!("--{}\nContent-Disposition: form-data; name=\"file\"; filename=\"{}\"\nContent-Type: application/octet-stream\n\n{:?}", boundary, name.unwrap_or(HTTP_POST_NO_FILENAME), data)
+                }
+            });
+
+            data.push(format!("--{}--", boundary));
+            data.join("\n")
+        };
+
+        HTTPRequest::new(HTTPMethod::POST, uri, 1.1, hash_map!["Content-Type" => format!("multipart/form-data; boundary={}", boundary).as_str()], body)
+    }
 }
+
 
 pub struct HTTPResponse {
     http_ver: f32,
@@ -621,11 +887,11 @@ impl HTTPResponse {
         let re_http_header = Regex::new(REGEX_HTTP_HEADER)?;
 
         let mut lines = resp.lines()
-            .filter(|l| !l.is_empty())
             .map(|l| l.trim());
 
         let (http_ver, status, reason) = {
-            if let Some(line) = lines.next() && let [v, s, r, ..] = line.split(' ').collect::<Vec<&str>>()[..] {
+            if let Some(line) = lines.next() {
+                let ([v, s, r], _) = str_splitn_fixed::<_, 3>(line, ' ');
                 let nv = f32::from_str(&v.replace("HTTP/", ""))?;
                 if !HTTP_VERSIONS.contains(&nv) {
                     bail!("Invalid HTTP version: {}", nv)
@@ -638,8 +904,8 @@ impl HTTPResponse {
         };
 
         let mut headers = HashMap::<String, String>::new();
-        while let Some(line) = lines.next() && re_http_header.is_match(line)? {
-            if let [name, field, ..] = line.split(": ").collect::<Vec<&str>>()[..] {
+        while let Some(line) = lines.next() && !line.is_empty() {
+            if let [name, field, ..] = line.split(": ").collect::<Vec<&str>>()[..] && re_http_header.is_match(name)? {
                 headers.insert(String::from(name), String::from(field));
             } else {
                 bail!("Bad headers in HTTP response")
@@ -659,50 +925,6 @@ impl HTTPResponse {
     }
 }
 
-fn http_request_expect(reqt: HTTPRequest, r_timeout: Duration, w_timeout: Duration, r_max_attempts: usize, w_max_attempts: usize, should_bc: bool) -> Result<HTTPResponse, Error> {
-    let (reqt, mut resp) = (reqt.compile(), String::new());
-    let auth_cand = regextract(&Regex::new(REGEX_URI_AUTH).unwrap(), &reqt, "authority");
-
-    if let Some(auth) = auth_cand {
-        || -> Result<HTTPResponse, Error> { // "try-catch" behavior adapted https://stackoverflow.com/a/55756926/30291565
-            let pr_con = Promise::promise_if("\n▶ Connecting", should_bc);
-
-            let mut stream = TcpStream::connect(auth)?;
-            stream.set_read_timeout(Some(r_timeout))?;
-            stream.set_write_timeout(Some(w_timeout))?;
-
-            Promise::fulfill_if(pr_con, true);
-
-
-
-            let pr_write = Promise::promise_if("▶ Writing", should_bc);
-
-            let mut reqt_attempts = 0usize;
-            while let Err(_) = stream.write(reqt.as_bytes()) {
-                reqt_attempts += 1;
-                if reqt_attempts > w_max_attempts { bail!("Exceeded max request write attempts")}
-            }
-
-            Promise::fulfill_if(pr_write, true);
-
-
-
-            let pr_read = Promise::promise_if("▶ Reading", should_bc);
-
-            reqt_attempts = 0;
-            while let Err(_) = stream.read_to_string(&mut resp) {
-                reqt_attempts += 1;
-                if reqt_attempts > r_max_attempts { bail!("Exceeded max request read attempts")}
-            }
-
-            Promise::fulfill_if(pr_read, true);
-
-            HTTPResponse::from(&resp)
-        }()
-    } else {
-        Err(anyhow!("HTTP request failed or timed out"))
-    }
-}
 
 /// Constrained representation of a 1-sub decorated label.
 /// Effectively a wrapped version of `FmtStr`.
@@ -721,7 +943,7 @@ impl Label {
         }
     }
 
-    /// Creates new `Label` from collated, erring if a valid 1-sub `FmtStr` cannot be created.
+    /// Creates new [`Label`] from collated, erring if a valid 1-sub [`FmtStr`] cannot be created.
     ///
     /// # Caveats
     /// Note that the label string must distinguish ident and ornament by wrapping ident with {}.
@@ -751,10 +973,13 @@ impl Label {
     }
 }
 
+
+
 /// Representation of the segment structure (labeled ordered possibly-recursive groups of strings).
 pub struct Segment {
     eid: Label,
     content: Either<Vec<Segment>, String>, // assume (a)...(z) then 1. to $LEN., bound by italic
+    segdirs: Vec<SegmentDirective>
 }
 
 impl Segment {
@@ -774,7 +999,8 @@ impl Segment {
 
                 format!("\\item[{}]\n\\begin{{enumerate}}{}\\nq\\end{{enumerate}}\n", eid, con)
             },
-            Right(con) => format!("\\item[{}]{}\\sqe", eid, con)
+            Right(con) if self.segdirs.contains(&SegmentDirective::Condense) => format!("\\item[{}]{}", eid, con),
+            Right(con) => format!("\\item[{}]{}\\sqe", eid, con),
         }
     }
 }
@@ -860,22 +1086,36 @@ impl MarkdownDoc {
     ///
     /// # Caveats
     /// Panicks if path was invalid or file could not be read. This behavior may change in the future (i.e. return Result<Self, ()>).
-    pub fn new(path: &str) -> Self {
-        let (file, title) = (File::open(path).expect("Could not read file"), path.split('.').next().expect("File format bad").to_string());
-        let content = BufReader::new(file).lines()
-            .filter_map(|l| l.ok().and_then(|s| Some(s.trim().to_string())))
+    pub fn from(path: &Path) -> Self {
+        let pr_nab = Promise::only_wish("Nabbing");
+        let lines = fs::read_to_string(path).expect("Could not read doc")
+            .lines()
+            .map(|l| l.trim().to_string())
             .collect::<Vec<String>>();
+        pr_nab.fulfill(true);
 
         let pr_prep = Promise::only_wish("Preprocessing");
-
-        let mut content = preprocess_content(content)
-            .into_iter()
-            .peekable();
-
+        let preproc = preprocess_content(lines);
         pr_prep.fulfill(true);
 
-        // Note on parsing decls... strips all $ — may be problematic for decl macros that use $$, but obsitex theoretically shouldn't permit it.
+        let (pr_lho, path_lho) = (Promise::only_wish("Writing object file"), format!("{}.lho", path.file_stem().unwrap().display()));
+        fs::write(&path_lho, preproc.join("\n")).expect("Could not write object file");
+        pr_lho.fulfill(true);
 
+        Self::from_lho(Path::new(&path_lho))
+    }
+
+    pub fn from_lho(path: &Path) -> Self {
+        let pr_lho = Promise::only_wish("Reading object file");
+        let buf = fs::read_to_string(path).expect("Could not read object file");
+        let mut content = buf
+            .lines()
+            .map(|l| l.trim().to_string())
+            .into_iter()
+            .peekable();
+        pr_lho.fulfill(true);
+
+        // Note on parsing decls... strips all $ — may be problematic for decl macros that use $$, but obsitex theoretically shouldn't permit it.
 
         // Take first (and only) document in YAML db.
         let pr_decls = Promise::only_wish("Injecting decls");
@@ -884,11 +1124,11 @@ impl MarkdownDoc {
         let cold_decls = doc["decls"].as_mut_vec().expect("Bad decls array"); // TODO fill hole of expectation sadness
 
         let decl_ids: Vec<String> = cold_decls.iter().map(|d| {
-                d.as_hash().expect("Bad decls YAML")
-                    .get(&Yaml::String("id".to_string()))
-                    .map(|s| s.as_str().unwrap().to_string())
-                    .unwrap()
-            }).collect();
+            d.as_hash().expect("Bad decls YAML")
+                .get(&Yaml::String("id".to_string()))
+                .map(|s| s.as_str().unwrap().to_string())
+                .unwrap()
+        }).collect();
 
         // >NEW< change since a9d665b!
         // Making local decl parsing more forgiving by simply skipping all non-decl content.
@@ -914,7 +1154,7 @@ impl MarkdownDoc {
                 !decl_ids.contains(&caps["id"].to_string())
             })
             .collect();
-        if !db_cands.is_empty() && query(&format!("{} new decls found, add to db? (y/n)", db_cands.len())) == "y" { // <-- note! contingent on short-circuit eval of boolean.
+        if !db_cands.is_empty() && query(&format!("\n{} new decls found, add to db? (y/n)", db_cands.len())) == "y" { // <-- note! contingent on short-circuit eval of boolean.
             // let mut dump = String::new(); <-- TODO save mem by reusing same variables, must fix mut rules
             // let mut emitter = YamlEmitter::new(&mut dump);
 
@@ -946,21 +1186,27 @@ impl MarkdownDoc {
         while let Some(_) = content.peek() {
             let seg = {
                 while let Some(_) = content.next_if(|l| !re1.is_match(l).unwrap()) {} // <-- jump until (before) seg depth=1 tag
-                let eid1 = Label::from(format!("{{{}}}.", consume_eid(&mut content, &re1).unwrap()));
+                let (eid1, sdc1) = {
+                    let (e1, s1) = consume_eid(&mut content, &re1);
+                    (Label::from(format!("{{{}}}.", e1.unwrap())), s1.map(|mut s| SegmentDirective::extract(&mut s)).unwrap_or(Vec::new()))
+                };
 
                 // Check if subsegs are present... (a), (b), etc etc
                 if re2.is_match(&content.peek().unwrap()).unwrap() {
                     let mut subsegs: Vec<Segment> = Vec::new();
 
                     while content.peek().is_some_and(|c| !re1.is_match(c).unwrap()) { // <-- must check for EOF!
-                        let eid2 = Label::from(format!("({{{}}})", consume_eid(&mut content, &re2).unwrap()));
-                        subsegs.push(consume_segment(&mut content, &re0, eid2.unwrap()));
-                      //  content.next_if(|l| !re1.is_match(l));
+                        let (eid2, sdc2) = {
+                            let (e2, s2) = consume_eid(&mut content, &re2);
+                            (Label::from(format!("({{{}}})", e2.unwrap())), s2.map(|mut s| SegmentDirective::extract(&mut s)).unwrap_or(Vec::new()))
+                        };
+                        subsegs.push(consume_segment(&mut content, &re0, eid2.unwrap(), sdc2));
+                        //  content.next_if(|l| !re1.is_match(l));
                     }
 
-                    Segment { eid: eid1.unwrap(), content: Left(subsegs) }
+                    Segment { eid: eid1.unwrap(), content: Left(subsegs), segdirs: sdc1 }
                 } else {
-                    consume_segment(&mut content, &re1, eid1.unwrap())
+                    consume_segment(&mut content, &re1, eid1.unwrap(), sdc1)
                 }
             };
 
@@ -969,9 +1215,10 @@ impl MarkdownDoc {
 
         pr_segs.fulfill(true);
 
-        // // TODO image cache
+        // TODO image cache
         // let cache = None;
 
+        let title = path.file_stem().unwrap().display().to_string();
 
         Self { title, decls: hot_decls, segs/*, cache*/ }
     }
@@ -1055,11 +1302,11 @@ fn monthize(month: u8) -> String {
 fn capitalize(word: &str) -> String {
     let mut new = String::from(word);
 
-    if word.is_empty() {
+    if !word.is_empty() {
         // SAFETY: already checked so string must be non-empty!
         unsafe {
             let bytes = new.as_bytes_mut();
-            bytes[0] += 32;
+            bytes[0] += ((b'a'..=b'z').contains(&bytes[0]) as u8) & 32;
         }
     }
 
@@ -1126,7 +1373,7 @@ fn parse_decls(yamls: &Yaml) -> String {
 /// or subbing/stripping disallowed characters. Preprocessing instead performs line-wise formatting, parsed substitution, and the like.
 ///
 /// Note that this purposefully is not optimized as performance not critical for compilation; you can write
-/// the output to a separate designated "object" file if you want (e.g. .lho)
+/// the output to a separate designated "object" file if you want (e.g. .lho or .pli)
 ///
 /// # Caveats
 /// Applying all preprocessing will:
@@ -1136,7 +1383,14 @@ fn parse_decls(yamls: &Yaml) -> String {
 ///
 /// Behavior may be modified as necessary.
 pub fn preprocess_content(mut content: Vec<String>) -> Vec<String> {
-    // === Trim newlines (>=2 -> 1 \n) ===
+    // ▼ REVERSE (AND UNDO) ▼
+    // Reverse the vec to get the proper end for FIFO. This is undone afterward !
+    // note this is preferred over `VecDeque` and `pop_front()` as lack of utilities (e.g. `dedup`) and no need for other tail;
+    // `VecDeque` generally trades excellent head/tail pop/push for more broad overhead while `Vec` has terrible overhead for non-end pop/push but good caching.
+    // ...per https://stackoverflow.com/questions/68351027/why-is-vecdeque-slower-than-a-vec
+    content.reverse();
+
+    // ▼ TRIM NEWLINES (>=2 -> 1 \n) ▼
     //
     // Old attempt...
     // let trimees = content.windows(2)
@@ -1149,7 +1403,7 @@ pub fn preprocess_content(mut content: Vec<String>) -> Vec<String> {
     //
     content.dedup_by(|a, b| a.is_empty() && b.is_empty()); // <-- .o. wowz, turns out this already exists and saves so much time! :D
 
-    // === Parse directives ===
+    // ▼ PARSE DIRECTIVES ▼
     //
     // Valid ones are:
     // - &IGNORE_DECLS              ... slight speed-up if you know decls are all added
@@ -1176,21 +1430,37 @@ pub fn preprocess_content(mut content: Vec<String>) -> Vec<String> {
     // ...note that `is_some_and(|[l1, l2, ..]| l1.contains("%%") || l2.contains("%%"))` feels plausible but the compiler
     //    cannot guarantee length of arrays (even if it's [N; 2]!) so refutable closure pattern.
 
-    if content.first().is_some_and(|l| l.is_empty()) { content.remove(0); } // this simple check saves many simple checks later... net profit vuv
+    if content.last().is_some_and(|l| l.is_empty()) { content.pop(); } // this simple check saves many simple checks later... net profit vuv
 
-    if content.first().is_some_and(|l| l.contains("%%")) {
-        let mut lines = content.iter().skip(1);
+    if let Some(_) = content.pop_if(|l| l.contains("%%")) {
         let mut directives = Vec::<PreprocessorDirective>::new();
 
-        while let Some(line) = lines.next() && !line.contains("%%") {
+        while let Some(line) = content.pop() && !line.contains("%%") {
             if let Ok(dir) = PreprocessorDirective::from(line.trim()) {
                 directives.push(dir);
             }
         }
 
+        // move any priority directives to front of vec
+        // TODO
+
+        // undo fifo reversal
+        content.reverse();
+
+        // perform necessary pre-preprocessing
+        let (rp_fans, rp_pans) = (Regex::new(RERPL_PREPROC_FINALANS).unwrap(), Regex::new(RERPL_PREPROC_PARTANS).unwrap());
+
+        for line in content.as_mut_slice() {
+            // filling \finalans (##) and \partans (@@) macros
+            *line = rp_fans.replace(line, r"$left\finalans{$mid}$right").to_string();
+            *line = rp_pans.replace(line, r"$left\partans{$mid}$right").to_string();
+
+        }
+
         PreprocessorDirective::preprocess(&directives, &mut content);
     }
 
+    // ▼ AL DENTE! ▼
     content
 }
 
@@ -1201,39 +1471,17 @@ pub fn preprocess_content(mut content: Vec<String>) -> Vec<String> {
 /// Errs if content could not be converted to base64 or failed to send/receive TCP payload to Overleaf servers.
 pub fn export_overleaf(tex: TeXContent, should_bc: bool) -> Result<URI, Error> {
     // Encode into base64 (adapt from https://mcyoung.xyz/2023/11/27/simd-base64/#ascii-to-sextet)
-    let pr_enc = Promise::promise_if("Encoding", should_bc);
-
-    let bex = str2base64::<BASE64_VECTOR_SIZE>(&tex);
-
-    Promise::fulfill_if(pr_enc, true);
-
-
+    // let pr_enc = Promise::promise_if("Encoding", should_bc);
+    // let bex = str2base64::<BASE64_VECTOR_SIZE>(&tex)?;
+    // Promise::fulfill_if(pr_enc, true);
 
     let pr_expo = Promise::promise_if("Exporting", should_bc);
 
-    let expo = bex.map_err(|_| anyhow!("Failed to base64 encode TeX or send/receive TCP payload"))
-        .and_then(|t| {
-        let reqt = HTTPRequest::new(
-            HTTPMethod::POST,
-            URI::new_unchecked("https://www.overleaf.com:80/docs"),
-            1.1,
-            hash_map![],
-            format!("data:application/x-tex;base64,{}", t)
-        )?; // guaranteed valid
+    let mut reqt = HTTPRequest::multipost(Left(&*tex), URI::new_unchecked("http://0x0.st/"), Some("file.tex"), hash_map!["expires" => "1"])?;
+    reqt.hfill();
 
-            // println!("{}", reqt.compile());
-            //
-            // let reqt = HTTPRequest::new(
-            //     HTTPMethod::GET,
-            //     URI::new_unchecked("https://www.overleaf.com:80"),
-            //     1.1,
-            //     hash_map![],
-            //     String::new(),
-            // )?;
-
-        let resp = http_request_expect(reqt, Duration::from_secs(HTTP_RW_TIMEOUT_SEC), Duration::from_secs(HTTP_RW_TIMEOUT_SEC), HTTP_RW_MAX_ATTEMPTS, HTTP_RW_MAX_ATTEMPTS, true)?;
-        URI::new(&FmtStr::only_fmt(OVERLEAF_URL, &resp.payload)?)
-    });
+    let resp = reqt.send(Duration::from_secs(HTTP_RW_TIMEOUT_SEC), Duration::from_secs(HTTP_RW_TIMEOUT_SEC), true)?;
+    let expo = URI::new(&FmtStr::only_fmt(OVERLEAF_URL, &resp.payload)?);
 
     Promise::fulfill_if(pr_expo, true);
     expo
@@ -1247,7 +1495,9 @@ pub fn export_overleaf(tex: TeXContent, should_bc: bool) -> Result<URI, Error> {
 ///
 /// # Caveats
 /// The database must retain a valid format (e.g. array of 'decls' and 'statics' with identical destructured arrays as entries.
-pub fn scan_lhi(lhi: &File) {
+pub fn scan_lhi(path: &Path) -> Result<(), Error>{
+    let lhi = File::open(path)?;
+
     let mut buf = BufReader::new(lhi)
         .lines()
         .filter(|l| l.is_ok()) // <-- errs if invalid UTF-8. Also a neat idea, what if you could do "l.is_ok_and(!str::is_empty)"?
@@ -1302,9 +1552,31 @@ pub fn scan_lhi(lhi: &File) {
         Yaml::Hash(hash)
     };
 
-    write_db(&doc);
+    write_db(&doc)?;
 
     println!("⊛ {} (+ {} replaced) decls, {} statics", num_decl_new, num_decl_rep, num_static);
+
+    Ok(())
+}
+
+/// Scans all .lhi files in the working directory.
+pub fn scan_lhis() -> Result<(), Error> {
+    for lhi in fs::read_dir(".")? // per https://stackoverflow.com/a/75880545/30291565
+        .filter_map(|res| res.ok())
+        .map(|entry| entry.path())
+        .filter_map(|path| {
+            if path.extension().map_or(false, |ext| ext == "lhi") {
+                Some(path)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>()
+    {
+        scan_lhi(&lhi)?;
+    }
+
+    Ok(())
 }
 
 /// Converts the collated decl into a YAML entry using [assemble_decl].
@@ -1349,7 +1621,7 @@ fn query(msg: &str) -> String {
 /// # Caveats
 /// Cannot guarantee that immediate next token contains matching EID so must manually pass the constructed segment's EID.
 /// Likewise, cannot know what to use to end stepping so must manually pass in delimiting pattern.
-fn consume_segment<I: Iterator<Item = String>>(content: &mut Peekable<I>, delim: &Regex, eid: Label) -> Segment {
+fn consume_segment<I: Iterator<Item = String>>(content: &mut Peekable<I>, delim: &Regex, eid: Label, segdirs: Vec<SegmentDirective>) -> Segment {
     let mut body = content.next().unwrap(); // <-- no add'l formatting for initial segment separator. This should always exist.
     body.push('\n');
     let re_qq = Regex::new(REGEX_USES_QQ).unwrap();
@@ -1366,6 +1638,9 @@ fn consume_segment<I: Iterator<Item = String>>(content: &mut Peekable<I>, delim:
             l if l.is_empty() => {
                 String::from("\\\\")
             },
+            _ if segdirs.contains(&SegmentDirective::Condense) => {
+                String::from("\n")
+            }
 
             l if l.eq(LINE_BREAK) => {
                 String::from("\\sqe\n")
@@ -1383,15 +1658,22 @@ fn consume_segment<I: Iterator<Item = String>>(content: &mut Peekable<I>, delim:
         body.push_str(&append);
     }
 
-    Segment { eid, content: Right(body) }
+    Segment { eid, content: Right(body), segdirs }
 }
 
-/// Consume EID from the immediate following token.
+/// Consume effective identifier (EID) and segdirs chunk (SDC) from the immediate following token.
+/// Note this is preferred over returning `(Option<String>, Option<String>)` as existence of EID guarantees SDC.
 ///
 /// # Caveats
 /// May require other operations in future hence separation from its (one) usage.
-fn consume_eid<I: Iterator<Item = String>>(content: &mut I, re: &Regex) -> Option<String> {
-    regextract(re, &content.next().unwrap(), "eid")
+fn consume_eid<I: Iterator<Item = String>>(content: &mut I, re_eid: &Regex) -> (Option<String>, Option<String>) {
+    let re_sdc = Regex::new(REGEX_SEGDIRS).unwrap();
+
+    if let Some(line) = content.next() {
+        (regextract(re_eid, &line, "eid"), regextract(&re_sdc, &line, "sdc"))
+    } else {
+        (None, None)
+    }
 }
 
 /// Assembles decl YAML given named regex captures.
@@ -1455,6 +1737,23 @@ fn regmerge(re1: &Regex, re2: &Regex) -> Regex {
     Regex::new(&format!(r"({})|({})", str1, str2)).unwrap()
 }
 
+/// Equivalent to [str::splitn] but returns a fixed-length `[&str; N]` instead of `SplitN<'_>` for easier binding.
+///
+/// # Caveats
+/// Still uses [str::splitn], which will give 0 ≤ `n` ≤ N items dependent on how many splits.
+/// If less than N, empty &str will be stored in trailing spots. Use the returned `usize` to track `n`.
+#[inline(always)]
+fn str_splitn_fixed<P: Pattern, const N: usize>(str: &str, pat: P) -> ([&str; N], usize) {
+    let (mut buf, mut len, split) = ([str; N], 0usize, str.splitn(N, pat));
+
+    for (i,s) in split.enumerate() {
+        buf[i] = s;
+        len += 1;
+    }
+
+    (buf, len)
+}
+
 //fn load_db<'d>() -> (&'d mut Array, &'d mut Array, BufWriter<File>) {
 
 /// Opens and parses the YAML decls/statics database.
@@ -1473,7 +1772,7 @@ fn open_db() -> Yaml {
 ///
 /// # Caveats
 /// Panicks if the given YAML is not valid or dumpable.
-fn write_db(doc: &Yaml) {
+fn write_db(doc: &Yaml) -> Result<(), Error>{
     let mut db = OpenOptions::new()
         .write(true)
         .append(false)
@@ -1481,9 +1780,10 @@ fn write_db(doc: &Yaml) {
         .unwrap();
     let mut dump = String::new();
     let mut emitter = YamlEmitter::new(&mut dump);
-    emitter.dump(doc).unwrap();
+    emitter.dump(doc)?;
 
-    db.write_all(dump.as_bytes()).expect("Could not write to decl DB");
+    db.write_all(dump.as_bytes())?;
+    Ok(())
 }
 
 /// Helper function for converting Rust string to YAML string.
@@ -1831,6 +2131,29 @@ mod tests {
     }
 
     #[test]
+    fn http_multipost() {
+        let res = HTTPRequest::multipost(Left("000CD!"), URI::new_unchecked("http://0x0.st/"), Some("wow.txt"), hash_map!["expires" => "1"]);
+
+        to_clipboard(&res.unwrap().compile());
+
+//         assert!(res.is_ok());
+//         assert_eq!(res.unwrap().compile(), "POST / HTTP/1.1\n\
+// Host:  0x0.st\n\
+// Content-Type: multipart/form-data; boundary=------------------------boundary123\n\
+// \n\
+// --------------------------boundary123\n\
+// Content-Disposition: form-data; name=\"file\"; filename=\"file\"\n\
+// Content-Type: application/octet-stream\n\
+// \n\
+// 4588484564849849846546546846848646\n\
+// --------------------------boundary123\n\
+// Content-Disposition: form-data; name=\"expires\"\n\
+// \n\
+// 1\n\
+// --------------------------boundary123--")
+    }
+
+    #[test]
     fn base64_sm_rl_symm() {
         base64_test("000", "MDAw");
     }
@@ -1888,6 +2211,13 @@ mod tests {
     #[test]
     fn base64_med_rf0() {
         base64_test("abcjiawefjaiweawe", "YWJjamlhd2VmamFpd2Vhd2U=");
+    }
+
+    #[test]
+    fn seg() {
+        let re = Regex::new(REGEX_SEG_D2).unwrap();
+        assert!(re.is_match("*(a)*").unwrap());
+        assert!(re.is_match("*(a)* %C{}%").unwrap());
     }
 
     // #[test]

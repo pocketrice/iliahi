@@ -1,6 +1,6 @@
 [package]
 name = "iliahi"
-version = "0.1.0"
+version = "2.0.0"
 edition = "2024"
 
 [dependencies]
@@ -10,3 +10,4 @@ either = "1.15.0"
 chrono = "0.4.42"
 anyhow = "1.0.100"
 map-macro = "0.3.0"
+open = "5.3.2"
