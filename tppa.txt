@@ -1,0 +1,40 @@
+THIRD-PARTY PROXY AGREEMENT
+----------------------------
+
+Usage of the iliahi tool (hereby "Tool") by you, the user, to upload to the Overleaf
+servers (hereby "Overleaf"), due to technical limitations, requires the use of an accessible URI
+directed at the LaTeX content/file to be imported. The aforementioned resource may be hosted by the
+user or in this case hosted temporarily by a third-party server accessible by both user and Overleaf
+(hereby "Proxy").
+
+In choosing to utilize the Proxy to facilitate importing compiled LaTeX documents from the Tool, the
+User acknowledges the following good-faith terms:
+
+- Usage of the Proxy and Overleaf is not officially recognized or endorsed, availability and terms may change at
+  any time. It is asked of the user that they follow best practices and etiquette for uploading to the Proxy and
+  Overleaf.
+
+- The user shall post files to the Proxy with expiration of at most one (1) hour, through the designated
+  indication method (e.g. "expires" HTTP multipart field).
+
+- The user shall not maliciously or willingly post a significant number of requests to the Proxy. The Tool
+  provides the option every use for uploading to Overleaf via the Proxy which sends a single isolated
+  request.
+
+- The user shall monitor and acknowledge the accrued amount of content (measured in bytes) sent and stored
+  by the Proxy and should abstain from exceeding the recommended per-hour count or by common sense to avoid
+  overloading the Proxy.
+
+- No malicious or inappropriate resources shall be willingly encoded or stored in the input raw/object file
+  into the Tool or uploaded to the Proxy nor Overleaf.
+
+- Please read the terms of use for both the Proxy and Overleaf prior to usage of the Tool with either service.
+
+
+If you disagree or refuse to abide by any of these rules please kindly decline the TPPA. The TPPA is not
+legally binding but rather a good-faith request and acknowledgment of the user to respect generously provided
+public infrastructure.
+
+Thank you!
+
+Last updated 11-07-2025
