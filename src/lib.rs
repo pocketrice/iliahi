@@ -46,7 +46,7 @@ static VERSION_NUM: &str = "2.0.0";
 static VERSION_BRANCH: &str = "ALPHA";
 
 
-static FMT_ANCHOR: &str = "{}";
+pub static FMT_ANCHOR: &str = "{}";
 static SEG_SENTINEL: &str = "*(S)*";
 static REGEX_META_NCAP: &str = r".*\(\?P<(?P<ncap>.+)>.*\).*"; // <-- note, this means only limited to one named capture group for regmerge!
 static REGEX_SEG_D1: &str = r"^\*\*(?P<eid>.+)\.\*\*( %.+%)?$";
@@ -100,6 +100,7 @@ static PROMISE_NG: &str = "NG";
 static PROMISE_DEF_PRECISION: usize = 3;
 static OVERLEAF_URL: Fmtr = "https://www.overleaf.com/docs?snip_uri={}";
 static BASE64_VECTOR_SIZE: usize = 32; // <-- 2024 standard is AVX2 (256b) or SVE2 (128-1024b in 128b incr); using Assignments 1-9 avg=4620c, stdev=2085c. Using 1024b/128B would be most optimal but seems like 256b/32B is safer.
+
 //static BASE64_VECTOR_OFFS: [i8; 5] = [b'A' as i8, (b'a' - 26) as i8, (52 - b'0') as i8, (62 - b'+') as i8, (63 - b'/') as i8]; // <-- add these to 6-bit value to receive the base64 representation!
 
 // raws         maps      ascii
@@ -118,6 +119,8 @@ static BASE64_VECTOR_SIZE: usize = 32; // <-- 2024 standard is AVX2 (256b) or SV
 /// Matches n elements against item.
 /// This is redundant as you may actually pass & and | notation into `matches!`.
 /// So, simply some macro-writing practice!
+
+
 #[deprecated]
 macro_rules! matches_n {
     // ▼ item to match against
@@ -1690,7 +1693,7 @@ fn assemble_decl(caps: &Captures) -> Yaml { // <-- I don't think this is designe
 }
 
 /// Extracts named capture group from matching the given haystack, if present.
-fn regextract(re: &Regex, haystack: &str, name: &str) -> Option<String> {
+pub fn regextract(re: &Regex, haystack: &str, name: &str) -> Option<String> {
     let caps = re.captures(haystack).unwrap();
     caps.and_then(|c| c.name(name).map(|m| m.as_str().to_string())) // <-- m is of type `Match<'_>`, not `&str`
 }
@@ -1700,7 +1703,7 @@ fn regextract(re: &Regex, haystack: &str, name: &str) -> Option<String> {
 /// # Caveats
 /// Note that returns `Err` if regex could not match, while returns `Some([None, None..])` if regex able to match but no captures.
 /// This is for avoiding requiring two matches if need to check for regex validity and actual captures (e.g. add'l `Regex::is_match`).
-fn regextract_n<const N: usize>(re: &Regex, haystack: &str, names: [&str; N]) -> [Option<String>; N]
+pub fn regextract_n<const N: usize>(re: &Regex, haystack: &str, names: [&str; N]) -> [Option<String>; N]
 where [Option<String>; N]: Default {
     if let Some(caps) = re.captures(haystack).unwrap() {
         names.map(|n| caps.name(n).and_then(|c| Some(c.as_str().to_string())))
